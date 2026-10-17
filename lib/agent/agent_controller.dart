@@ -222,25 +222,49 @@ class AgentController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Saves an OpenAI-compatible custom provider (base URL + API key + one
-  /// model ID) in the agent's models.json. An empty [apiKey] while editing
-  /// keeps the stored key.
+  /// Saves an OpenAI-compatible custom provider (base URL + API key + one or
+  /// more models) in the agent's models.json. Each model entry is a map with
+  /// an `id` plus optional metadata (name, contextWindow, maxTokens,
+  /// reasoning, vision) as returned by [fetchCustomProviderModels]. An empty
+  /// [apiKey] while editing keeps the stored key.
   Future<void> saveCustomProvider({
     required String id,
     required String name,
     required String baseUrl,
     required String apiKey,
-    required String modelId,
+    required List<Map<String, dynamic>> models,
   }) async {
     await client.call('custom_provider_save', {
       'provider': id,
       'name': name,
       'baseUrl': baseUrl,
       'apiKey': apiKey,
-      'model': modelId,
+      'models': models,
     });
     await refreshProviders();
     notifyListeners();
+  }
+
+  /// Fetches the model catalog of an OpenAI-compatible endpoint
+  /// (GET <baseUrl>/models) so the user can pick models from a list instead
+  /// of typing every ID. An empty [apiKey] together with a [providerId]
+  /// reuses the key stored for that provider. Returns descriptor maps:
+  /// `id`, plus `name`, `contextWindow`, `maxTokens`, `reasoning` and
+  /// `vision` when the endpoint reports them.
+  Future<List<Map<String, dynamic>>> fetchCustomProviderModels({
+    required String baseUrl,
+    required String apiKey,
+    String? providerId,
+  }) async {
+    final data = await client.call<Map<String, dynamic>>('custom_provider_fetch_models', {
+      'baseUrl': baseUrl,
+      'apiKey': apiKey,
+      if (providerId != null) 'provider': providerId,
+    });
+    return [
+      for (final m in (data['models'] as List? ?? const []))
+        if (m is Map) m.cast<String, dynamic>(),
+    ];
   }
 
   /// Removes a custom provider and its stored API key.

@@ -29,6 +29,22 @@ class ProviderInfo {
   bool get custom => json['custom'] == true;
   String? get baseUrl => json['baseUrl'] as String?;
   String? get customModel => json['customModel'] as String?;
+
+  /// Model entries stored for a custom provider: an `id` plus whatever
+  /// metadata the endpoint reported (name, contextWindow, maxTokens,
+  /// reasoning, input). Empty for built-in providers.
+  List<Map<String, dynamic>> get customModels => [
+    for (final m in (json['customModels'] as List? ?? const []))
+      if (m is Map) m.cast<String, dynamic>(),
+  ];
+
+  /// Just the model IDs of a custom provider.
+  List<String> get customModelIds {
+    final ids = [for (final m in customModels) if (m['id'] is String) m['id'] as String];
+    if (ids.isNotEmpty) return ids;
+    final single = customModel;
+    return single == null ? const [] : [single];
+  }
 }
 
 class SessionSummary {
