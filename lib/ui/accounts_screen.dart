@@ -71,7 +71,7 @@ class _AccountsScreenState extends State<AccountsScreen> {
                                 'Create a classic token with the repo and workflow scopes, then paste it here.',
                             linkLabel: 'Create a token',
                             onLink: () => widget.agent.client.openUrl(
-                              'https://github.com/settings/tokens/new?scopes=repo,workflow,read:org&description=AndroPI',
+                              'https://github.com/settings/tokens/new?scopes=repo,workflow,read:org&description=CoderRa',
                             ),
                             hint: 'ghp_… or github_pat_…',
                             onConnect: (t) => _guard(() => it.githubLogin(t), success: 'GitHub connected'),

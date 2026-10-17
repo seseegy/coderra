@@ -281,7 +281,7 @@ class _TasksScreenState extends State<TasksScreen> {
                     const SizedBox(width: 8),
                     Expanded(
                       child: Text(
-                        'Schedules run while AndroPI is alive; a persistent notification keeps it running.',
+                        'Schedules run while CoderRa is alive; a persistent notification keeps it running.',
                         style: text.bodySmall?.copyWith(color: p.muted),
                       ),
                     ),

@@ -66,8 +66,8 @@ export function parseSearch1apiKeys(blob?: string): string[] {
 	return out;
 }
 
-/** Client ID of the AndroPI GitHub OAuth App (device flow enabled). Public by design; no secret is used. */
-const GITHUB_CLIENT_ID = process.env.ANDROPI_GITHUB_CLIENT_ID ?? "Ov23lidVAetnaasSTbSU";
+/** Client ID of the CoderRa GitHub OAuth App (Rosyid's own, device flow enabled). Public by design; no secret is used. */
+const GITHUB_CLIENT_ID = process.env.ANDROPI_GITHUB_CLIENT_ID ?? "Ov23libEuNNcRivBVm13";
 
 /** Line output, plus an optional channel for structured CI progress. */
 export type Log = ((line: string) => void) & { ci?: (snapshot: CiSnapshot) => void };
@@ -225,6 +225,22 @@ export class Integrations {
 		return this.github(path, init);
 	}
 
+	/** Raw GitHub REST call with the stored token, for binary downloads. */
+	async githubRaw(path: string, init: RequestInit = {}): Promise<Response> {
+		const token = this.store.github?.token;
+		if (!token) throw new Error("Not signed in to GitHub");
+		return fetch(`https://api.github.com${path}`, {
+			...init,
+			headers: {
+				Accept: "application/vnd.github+json",
+				Authorization: `Bearer ${token}`,
+				"X-GitHub-Api-Version": "2022-11-28",
+				...(init.body ? { "Content-Type": "application/json" } : {}),
+				...init.headers,
+			},
+		});
+	}
+
 	async githubLogin(token: string) {
 		token = token.trim();
 		const user = await this.github("/user", {}, token);
@@ -286,7 +302,7 @@ export class Integrations {
 	private async githubOAuth(path: string, body: Record<string, string>) {
 		const res = await fetch(`https://github.com${path}`, {
 			method: "POST",
-			headers: { Accept: "application/json", "Content-Type": "application/json", "User-Agent": "AndroPI" },
+			headers: { Accept: "application/json", "Content-Type": "application/json", "User-Agent": "CoderRa" },
 			body: JSON.stringify(body),
 		});
 		const text = await res.text();
@@ -390,7 +406,7 @@ export class Integrations {
 		const key = join(this.home, ".ssh", "id_ed25519");
 		mkdirSync(join(this.home, ".ssh"), { recursive: true, mode: 0o700 });
 		if (!existsSync(key)) {
-			await run("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-C", "andropi", "-f", key], { cwd: this.home });
+			await run("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-C", "coderra", "-f", key], { cwd: this.home });
 		}
 		return readFileSync(`${key}.pub`, "utf8").trim();
 	}
@@ -708,7 +724,7 @@ export class Integrations {
 			log(`Creating GitHub repository ${gh.login}/${name}…`);
 			const repo = await this.github("/user/repos", {
 				method: "POST",
-				body: JSON.stringify({ name, private: false, description: "Deployed from AndroPI" }),
+				body: JSON.stringify({ name, private: false, description: "Deployed from CoderRa" }),
 			}).catch(async (e) => {
 				if ((e as any).status === 422) return this.github(`/repos/${gh.login}/${name}`);
 				throw e;
@@ -724,7 +740,7 @@ export class Integrations {
 			const staged = (await quiet(["diff", "--cached", "--name-only"])).trim();
 			const hasHead = await quiet(["rev-parse", "--verify", "HEAD"]).then(() => true, () => false);
 			if (staged || !hasHead) {
-				await git(["commit", "--allow-empty", "-m", options.message || "Deploy from AndroPI"]);
+				await git(["commit", "--allow-empty", "-m", options.message || "Deploy from CoderRa"]);
 			} else {
 				log("No changes to commit");
 			}

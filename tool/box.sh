@@ -11,7 +11,7 @@
 
 R="$ANDROPI_ROOTFS"
 if [ -z "$R" ] || { [ ! -e "$R/bin/sh" ] && [ ! -L "$R/bin/sh" ]; }; then
-  echo "box: the Linux container is not installed. Install it in AndroPI under Settings > Linux container." >&2
+  echo "box: the Linux container is not installed. Install it in CoderRa under Settings > Linux container." >&2
   exit 127
 fi
 

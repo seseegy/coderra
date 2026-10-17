@@ -195,7 +195,7 @@ String toolSummary(String? name, Map<String, dynamic>? args) {
 
   final value = switch (name) {
     'bash' => pick(['command'])?.replaceAllMapped(
-      RegExp(r'''(?:/data/(?:data|user/\d+)/com\.imtaqin\.andropi|/storage/emulated/\d+|/sdcard)(?:/[^\s'"/;|&>]+)+'''),
+      RegExp(r'''(?:/data/(?:data|user/\d+)/(?:com\.imtaqin\.andropi|id\.coderra\.app)|/storage/emulated/\d+|/sdcard)(?:/[^\s'"/;|&>]+)+'''),
       (m) => _shortPath(m[0]) ?? m[0]!,
     ),
     'read' || 'write' || 'edit' || 'ls' => _shortPath(pick(['path', 'file_path'])),

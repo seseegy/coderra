@@ -41,7 +41,7 @@ class AgentService : Service() {
         )
         val notification = Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_agent)
-            .setContentTitle("AndroPI")
+            .setContentTitle("CoderRa")
             .setContentText(intent?.getStringExtra("text") ?: "Agent is working")
             .setContentIntent(open)
             .setOngoing(true)

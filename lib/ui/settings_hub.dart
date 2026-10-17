@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:local_auth/local_auth.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
@@ -61,7 +63,7 @@ class _SettingsHubState extends State<SettingsHub> {
       try {
         final auth = LocalAuthentication();
         if (!await auth.isDeviceSupported()) throw tr('No screen lock is set on this phone.');
-        if (!await auth.authenticate(localizedReason: tr('Unlock AndroPI'))) return;
+        if (!await auth.authenticate(localizedReason: tr('Unlock CoderRa'))) return;
       } catch (e) {
         if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
         return;
@@ -161,7 +163,7 @@ class _SettingsHubState extends State<SettingsHub> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text('AndroPI', style: text.titleLarge),
+                          Text('CoderRa', style: text.titleLarge),
                           const SizedBox(height: 2),
                           Text(
                             'pi ${agent.info['version'] ?? ''} · Node ${agent.info['node'] ?? ''}',
@@ -322,7 +324,7 @@ class _SettingsHubState extends State<SettingsHub> {
                     icon: LucideIcons.fingerprint,
                     color: const Color(0xFFE11D48),
                     title: tr('App lock'),
-                    subtitle: tr('Fingerprint or screen lock when opening AndroPI'),
+                    subtitle: tr('Fingerprint or screen lock when opening CoderRa'),
                     trailing: Switch(value: look.appLock, onChanged: _setAppLock),
                     onTap: () => _setAppLock(!look.appLock),
                   ),
@@ -391,9 +393,12 @@ class _SettingsHubState extends State<SettingsHub> {
               ),
               SectionLabel(tr('Made by')),
               _DeveloperCard(openUrl: agent.client.openUrl),
+              const SizedBox(height: 10),
+              _ForkCard(openUrl: agent.client.openUrl),
               SectionLabel(tr('About')),
               SettingsGroup(
                 children: [
+                  _UpdateRow(agent: agent),
                   _InfoRow('Workspace', agent.info['workspace']?.toString() ?? '—'),
                   _InfoRow('Agent directory', agent.info['agentDir']?.toString() ?? '—'),
                   Padding(
@@ -537,6 +542,238 @@ class _DeveloperCard extends StatelessWidget {
                 label: tr('Repositories'),
                 onTap: () => openUrl('$github?tab=repositories'),
               ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The fork maintainer: CoderRa is a fork of AndroPI, modified by Rosyid.
+/// About row (CoderRa fork addition): checks the GitHub Releases of
+/// seseegy/coderra for a newer build. The host compares build numbers
+/// (CI sets versionCode = Actions run number) and caches successful
+/// checks for 6 hours. When an update exists, tapping downloads the APK
+/// inside the app (the host fetches the release asset with the user's
+/// GitHub token) and then hands it to the system installer.
+class _UpdateRow extends StatefulWidget {
+  const _UpdateRow({required this.agent});
+
+  final AgentController agent;
+
+  @override
+  State<_UpdateRow> createState() => _UpdateRowState();
+}
+
+class _UpdateRowState extends State<_UpdateRow> {
+  Map<String, dynamic>? _result;
+  bool _busy = false;
+  // Direct-download state: idle | downloading | ready | error.
+  String _dlState = 'idle';
+  int _received = 0;
+  int _total = 0;
+  String? _path;
+  String? _dlMessage;
+  String? _installNote;
+  Timer? _pollTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _check(false);
+  }
+
+  @override
+  void dispose() {
+    _pollTimer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _check(bool force) async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      final r = await widget.agent.client
+          .call<Map<String, dynamic>>('app_update_check', {'force': force});
+      if (mounted) setState(() => _result = r);
+    } catch (_) {
+      if (mounted) setState(() => _result = {'status': 'error'});
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _startDownload() async {
+    try {
+      final r = await widget.agent.client.call<Map<String, dynamic>>('app_update_download');
+      if (!mounted) return;
+      setState(() {
+        _dlState = 'downloading';
+        _received = 0;
+        _total = (r['size'] as num?)?.toInt() ?? 0;
+        _installNote = null;
+        _dlMessage = null;
+      });
+      final id = r['id']?.toString() ?? '';
+      _pollTimer?.cancel();
+      _pollTimer = Timer.periodic(const Duration(milliseconds: 700), (_) => _poll(id));
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _dlState = 'error';
+          _dlMessage = 'could not start';
+        });
+      }
+    }
+  }
+
+  Future<void> _poll(String id) async {
+    try {
+      final st = await widget.agent.client
+          .call<Map<String, dynamic>>('app_update_status', {'id': id});
+      if (!mounted) return;
+      final state = st['state']?.toString() ?? 'error';
+      setState(() {
+        _received = (st['received'] as num?)?.toInt() ?? _received;
+        _total = (st['total'] as num?)?.toInt() ?? _total;
+        if (state == 'done') {
+          _dlState = 'ready';
+          _path = st['path']?.toString();
+        } else if (state == 'error') {
+          _dlState = 'error';
+          _dlMessage = st['message']?.toString();
+        }
+      });
+      if (state != 'downloading') _pollTimer?.cancel();
+    } catch (_) {
+      // Polling glitch; the timer keeps trying.
+    }
+  }
+
+  Future<void> _install() async {
+    final path = _path;
+    if (path == null) return;
+    final res = await widget.agent.client.installApk(path);
+    if (!mounted) return;
+    setState(() {
+      _installNote = switch (res) {
+        'launched' => 'Installer opened — confirm to finish updating',
+        'needs-permission' => 'Allow installs for CoderRa on the screen that opened, then tap again',
+        _ => 'Could not open the installer',
+      };
+    });
+  }
+
+  String _mb(int bytes) => '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+
+  @override
+  Widget build(BuildContext context) {
+    final p = context.palette;
+    final r = _result;
+    final status = r?['status']?.toString();
+    final available = status == 'available';
+    final String sub;
+    if (_dlState == 'downloading') {
+      final pct = _total > 0 ? (_received * 100 ~/ _total) : 0;
+      sub = 'Downloading build b${r?['latestBuild']}… $pct% (${_mb(_received)} of ${_mb(_total)})';
+    } else if (_dlState == 'ready') {
+      sub = _installNote ?? 'Build b${r?['latestBuild']} downloaded — tap to install';
+    } else if (_dlState == 'error') {
+      sub = 'Download failed${_dlMessage != null ? ' ($_dlMessage)' : ''} — tap to retry';
+    } else if (r == null) {
+      sub = _busy ? 'Checking…' : 'Tap to check for updates';
+    } else {
+      final curV = (r['currentVersion'] ?? '').toString();
+      final head = curV.isEmpty ? 'Build b${r['currentBuild']}' : 'Version $curV · build b${r['currentBuild']}';
+      sub = switch (status) {
+        'available' => '$head — build b${r['latestBuild']} available, tap to download',
+        'current' => '$head — up to date',
+        'none' => '$head — no builds published yet',
+        'signed-out' => 'Sign in to GitHub in the app to check for updates',
+        _ => "Couldn't check — tap to retry",
+      };
+    }
+    final pct = _total > 0 ? (_received * 100 ~/ _total) : 0;
+    return SettingsRow(
+      icon: LucideIcons.refreshCw,
+      color: available ? const Color(0xFF22C55E) : p.accent,
+      title: tr('App updates'),
+      subtitle: sub,
+      trailing: _dlState == 'downloading'
+          ? Text('$pct%', style: Theme.of(context).textTheme.bodySmall)
+          : _dlState == 'ready'
+              ? const Icon(LucideIcons.check, size: 18)
+              : _busy
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : available
+                      ? const Icon(LucideIcons.download, size: 18)
+                      : null,
+      onTap: () {
+        if (_dlState == 'downloading') return;
+        if (_dlState == 'ready') {
+          _install();
+        } else if (available) {
+          _startDownload();
+        } else {
+          _check(true);
+        }
+      },
+    );
+  }
+}
+
+class _ForkCard extends StatelessWidget {
+  const _ForkCard({required this.openUrl});
+  final Future<void> Function(String url) openUrl;
+
+  static const github = 'https://github.com/seseegy';
+  static const repo = 'https://github.com/seseegy/coderra';
+
+  @override
+  Widget build(BuildContext context) {
+    final p = context.palette;
+    final text = Theme.of(context).textTheme;
+    return SurfaceCard(
+      onTap: () => openUrl(github),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Avatar(name: 'Rosyid', url: 'https://avatars.githubusercontent.com/u/221409196?v=4', size: 52),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Rosyid', style: text.titleLarge),
+                    Text(
+                      '@seseegy',
+                      style: TextStyle(fontFamily: mono, fontSize: 12.5, color: p.muted),
+                    ),
+                  ],
+                ),
+              ),
+              Icon(SimpleIcons.github, size: 22, color: p.text),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Text(
+            tr('Forked and modified by Rosyid. CoderRa adds custom providers, Search1API web tools, free Zelai models and more on top of AndroPI.'),
+            style: text.bodyMedium?.copyWith(color: p.muted),
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _LinkChip(icon: SimpleIcons.github, label: 'github.com/seseegy', onTap: () => openUrl(github)),
+              _LinkChip(icon: LucideIcons.folderGit2, label: 'seseegy/coderra', onTap: () => openUrl(repo)),
             ],
           ),
         ],

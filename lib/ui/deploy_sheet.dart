@@ -80,7 +80,7 @@ class _DeploySheetState extends State<_DeploySheet> {
 
   final folder = TextEditingController();
   late final name = TextEditingController(text: _base(widget.agent.cwd));
-  final message = TextEditingController(text: 'Deploy from AndroPI');
+  final message = TextEditingController(text: 'Deploy from CoderRa');
   late final remotePath = TextEditingController(text: it.hosts.firstOrNull?.path ?? '');
   late String? hostId = it.hosts.firstOrNull?.id;
   bool commit = true;

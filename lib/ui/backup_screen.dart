@@ -191,7 +191,7 @@ class _BackupScreenState extends State<BackupScreen> {
                   autocorrect: false,
                   onChanged: (_) => setState(() {}),
                   style: const TextStyle(fontFamily: mono, fontSize: 13),
-                  decoration: const InputDecoration(labelText: 'Backup file', hintText: '/…/andropi-backup.zip'),
+                  decoration: const InputDecoration(labelText: 'Backup file', hintText: '/…/coderra-backup.zip'),
                 ),
                 const SizedBox(height: 10),
                 Align(

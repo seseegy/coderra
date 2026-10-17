@@ -48,6 +48,12 @@ class AgentClient {
 
   Future<void> openUrl(String url) => _method.invokeMethod('openUrl', url);
 
+  /// Hands a downloaded APK to the system installer. Returns 'launched', or
+  /// 'needs-permission' when the user must first allow installs for this app
+  /// (the system settings screen is opened in that case).
+  Future<String> installApk(String path) async =>
+      (await _method.invokeMethod<String>('installApk', path)) ?? 'error';
+
   /// Whether this build can ask for shared storage at all (the Play build can't), whether it has it, and where it is.
   Future<({bool available, bool granted, String root})> storageAccess() async {
     final m = (await _method.invokeMethod<Map>('storageAccess'))!;
@@ -72,7 +78,7 @@ class AgentClient {
   /// Opens the Android share sheet for a file.
   Future<void> shareFile(String path) => _method.invokeMethod('shareFile', {'path': path});
 
-  /// Copies a file into the phone's Download/AndroPI folder; returns where it landed.
+  /// Copies a file into the phone's Download/CoderRa folder; returns where it landed.
   Future<String> saveToDownloads(String path) async =>
       (await _method.invokeMethod<String>('saveToDownloads', {'path': path}))!;
 

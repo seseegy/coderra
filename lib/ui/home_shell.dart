@@ -543,7 +543,7 @@ class _HomeTabState extends State<_HomeTab> {
                     GestureDetector(
                       onTap: () =>
                           Navigator.of(context).push(MaterialPageRoute(builder: (_) => AccountsScreen(agent: agent))),
-                      child: Avatar(name: gh?.name ?? gh?.login ?? 'AndroPI', url: gh?.avatarUrl, size: 44),
+                      child: Avatar(name: gh?.name ?? gh?.login ?? 'CoderRa', url: gh?.avatarUrl, size: 44),
                     ),
                   ],
                 ),

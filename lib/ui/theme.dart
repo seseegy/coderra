@@ -141,7 +141,7 @@ class Appearance extends ValueNotifier<ThemeMode> {
   }
 
   static final instance = Appearance._();
-  static final _file = File('/data/data/com.imtaqin.andropi/files/ui.json');
+  static final _file = File('/data/data/id.coderra.app/files/ui.json');
 
   bool onboarded = false;
   double textScale = 1;

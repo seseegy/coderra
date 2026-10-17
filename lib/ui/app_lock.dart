@@ -65,7 +65,7 @@ class _AppLockGateState extends State<AppLockGate> with WidgetsBindingObserver {
         setState(() => locked = false);
         return;
       }
-      final ok = await auth.authenticate(localizedReason: tr('Unlock AndroPI'));
+      final ok = await auth.authenticate(localizedReason: tr('Unlock CoderRa'));
       if (mounted && ok) setState(() => locked = false);
     } catch (e) {
       if (mounted) setState(() => error = '$e');
@@ -89,7 +89,7 @@ class _AppLockGateState extends State<AppLockGate> with WidgetsBindingObserver {
               children: [
                 const LogoMark(size: 56),
                 const SizedBox(height: 22),
-                Text(tr('AndroPI is locked'), style: text.titleLarge),
+                Text(tr('CoderRa is locked'), style: text.titleLarge),
                 if (error != null) ...[
                   const SizedBox(height: 8),
                   Text(

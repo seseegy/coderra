@@ -29,11 +29,13 @@ import {
 import { Checkpoints } from "./checkpoints.js";
 import { Container, type Distro } from "./container.js";
 import { installDohLookup } from "./dns.js";
+import { appUpdateDownloadStatus, checkAppUpdate, startAppUpdateDownload } from "./update.js";
 import * as gitops from "./gitops.js";
 import { Guard } from "./guard.js";
 import { Integrations, type Log } from "./integrations.js";
 import { installLenientTools } from "./lenient.js";
 import { Mcp } from "./mcp.js";
+import { patchedTools } from "./patched-tools.js";
 import { type RunSession, Runner } from "./runs.js";
 import { Skills } from "./skills.js";
 import { webTools } from "./web.js";
@@ -156,7 +158,11 @@ async function buildSession(sessionManager: SessionManager, opts: { interactive:
 		sessionManager,
 		resourceLoader,
 		tools: [...TOOLS, ...mcpTools.map((t) => t.name)],
-		customTools: [...webTools(() => integrations.searchKeys()), ...mcpTools] as any,
+		customTools: [
+			...patchedTools(cwd, { autoResizeImages: settingsManager.getImageAutoResize() }),
+			...webTools(() => integrations.searchKeys()),
+			...mcpTools,
+		] as any,
 	});
 	// Some models send "None" or numbers-as-strings for tool arguments.
 	installLenientTools(result.session.agent);
@@ -273,6 +279,8 @@ You are running inside CoderRa, an Android app, on the user's phone.
 
 - The shell is Android's /system/bin/sh (mksh) with toybox utilities, not bash.
   Prefer POSIX sh syntax. There is no sudo, apt or pkg.
+- Every bash call starts in the workspace directory; \`cd\` does not persist
+  between calls. A grep exit code of 1 means "no matches", not an error.
 - On PATH: \`node\`, \`git\`, \`ssh\`, \`ssh-keygen\`, \`scp\`, \`rsync\`, \`curl\`, \`rg\`, \`fd\`.
   With scp, pass \`-S ssh\`.
 - The workspace directory is ${workspace}. Projects live in subfolders of it.
@@ -666,15 +674,15 @@ async function deleteCustomProvider(cmd: Command) {
 function backupTarget() {
 	const stamp = new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
 	const shared = "/storage/emulated/0/Download";
-	const dir = existsSync(shared) ? join(shared, "AndroPI") : join(workspace, "backups");
+	const dir = existsSync(shared) ? join(shared, "CoderRa") : join(workspace, "backups");
 	try {
 		mkdirSync(dir, { recursive: true });
 		writeFileSync(join(dir, ".probe"), "");
 		unlinkSync(join(dir, ".probe"));
-		return join(dir, `andropi-backup-${stamp}.zip`);
+		return join(dir, `coderra-backup-${stamp}.zip`);
 	} catch {
 		mkdirSync(join(workspace, "backups"), { recursive: true });
-		return join(workspace, "backups", `andropi-backup-${stamp}.zip`);
+		return join(workspace, "backups", `coderra-backup-${stamp}.zip`);
 	}
 }
 
@@ -847,6 +855,16 @@ async function handle(cmd: Command): Promise<unknown> {
 		// Accounts, repositories, SSH and deploys (integrations.ts).
 		case "integrations":
 			return integrations.summary();
+		case "app_update_check":
+			return checkAppUpdate(agentDir, (p) => integrations.githubApi(p), !!(cmd as any).force);
+		case "app_update_download":
+			return startAppUpdateDownload(
+				agentDir,
+				(p) => integrations.githubApi(p),
+				(p, init) => integrations.githubRaw(p, init),
+			);
+		case "app_update_status":
+			return appUpdateDownloadStatus(String((cmd as any).id ?? ""));
 		case "github_login":
 			return integrations.githubLogin(cmd.token);
 		case "github_device_start":

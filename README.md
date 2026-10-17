@@ -1,26 +1,40 @@
 <p align="center">
-  <img src="assets/brand/logo.png" width="120" alt="AndroPI logo">
+  <img src="assets/brand/logo.png" width="120" alt="CoderRa logo">
 </p>
 
-<h1 align="center">AndroPI</h1>
+<h1 align="center">CoderRa</h1>
 
 <p align="center">An AI coding agent that runs on your Android phone.<br>
 Write, run, preview and deploy code without a laptop.</p>
 
 <p align="center">
-  <a href="https://play.google.com/store/apps/details?id=com.imtaqin.andropi"><b>Google Play</b></a> ·
-  <a href="https://github.com/imtaqin/andropi/releases/latest"><b>APK downloads</b></a> ·
-  <a href="https://andropi.imtaqin.id"><b>Website</b></a>
+  <a href="https://github.com/seseegy/coderra"><b>This repository</b></a> ·
+  <a href="https://github.com/imtaqin/andropi"><b>Upstream: AndroPI</b></a>
 </p>
 
-<p align="center">
-  <img src="store/en/screenshots-panorama.png" alt="AndroPI screenshots">
-</p>
+CoderRa is a fork of [AndroPI](https://github.com/imtaqin/andropi) by
+[imtaqin](https://github.com/fdciabdul), forked and modified by
+[Rosyid](https://github.com/seseegy). It puts the
+[pi coding agent](https://github.com/earendil-works/pi) on Android. The agent runs locally in a
+bundled Node.js runtime. It reads and writes files, runs shell commands in a real Debian or Alpine
+container, searches the web, and ships your project to GitHub Pages, Vercel or your own server. You
+bring the model: Anthropic, OpenAI, Gemini, OpenRouter and the other providers pi supports.
 
-AndroPI puts the [pi coding agent](https://github.com/earendil-works/pi) on Android. The agent runs locally in a
-bundled Node.js runtime. It reads and writes files, runs shell commands in a real Debian or Alpine container,
-searches the web, and ships your project to GitHub Pages, Vercel or your own server. You bring the model:
-Anthropic, OpenAI, Gemini, OpenRouter and the other providers pi supports.
+## What CoderRa adds
+
+- **Custom OpenAI-compatible providers.** Point the app at any gateway with a base URL and an API
+  key, register up to 500 models per provider by hand, or use **Fetch from server** to import the
+  gateway's `/v1/models` list (context window, max tokens, reasoning and vision flags included).
+- **Zelai (Free) built in.** A ready-to-use free provider with 20 models — no API key, no setup.
+- **Search1API web tools.** Paste any number of Search1API keys (no limit) and the agent rotates
+  to the next one automatically when a key runs out of credits, hits a limit or errors.
+  `web_search` and `web_fetch` use it when keys exist and fall back to the keyless chain otherwise,
+  and a dedicated `web_screenshot` tool renders pages to images (saved neatly under `screenshots/`).
+- **Project management.** Delete projects from the workspace right in the folder picker.
+- **Signed, update-friendly builds.** Every GitHub Actions build is signed with a fixed keystore,
+  so a new build installs over the previous one — no uninstall, no lost settings or chats.
+- **Its own identity.** Package `id.coderra.app` (installs side by side with AndroPI), CoderRa
+  branding throughout, and GitHub sign-in through CoderRa's own OAuth app.
 
 ## Features
 
@@ -41,7 +55,7 @@ Anthropic, OpenAI, Gemini, OpenRouter and the other providers pi supports.
   - MCP servers, skills (with a searchable skills catalogue), prompt templates and slash commands.
 - **Everyday use.**
   - Image and file attachments, and voice input.
-  - Share to AndroPI from other apps; home screen widget and Quick Settings tile.
+  - Share to CoderRa from other apps; home screen widget and Quick Settings tile.
   - Notifications.
   - Usage and cost tracking with a daily budget, and automatic fallback to another model.
   - App lock, encrypted tokens, and backup and restore.
@@ -72,6 +86,9 @@ flutter build appbundle --flavor play --release --target-platform android-arm,an
 Steps 1 and 2 generate files that are not in the repository (`jniLibs/`, `agent.zip`). Run them again after you
 change `tool/` or `agent/`.
 
+Pushes to `main` are built by GitHub Actions (`.github/workflows/build-apk.yml`); the release APKs
+are signed with the keystore kept in the repository secrets.
+
 ## Layout
 
 | Path | What it is |
@@ -85,6 +102,8 @@ change `tool/` or `agent/`.
 
 ## Credits
 
+- [AndroPI](https://github.com/imtaqin/andropi) by [imtaqin](https://github.com/fdciabdul): the app
+  CoderRa is forked from
 - [pi](https://github.com/earendil-works/pi): the coding agent (MIT)
 - [Termux packages](https://github.com/termux/termux-packages): the Android builds of Node.js, git, OpenSSH, proot
   and other tools bundled at build time, each under its own license
@@ -94,4 +113,5 @@ change `tool/` or `agent/`.
 
 ## License
 
-[MIT](LICENSE) © imtaqin ([@fdciabdul](https://github.com/fdciabdul))
+[MIT](LICENSE) © imtaqin ([@fdciabdul](https://github.com/fdciabdul)) — forked and modified by
+Rosyid ([@seseegy](https://github.com/seseegy))

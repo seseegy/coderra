@@ -139,7 +139,7 @@ class MainActivity : FlutterFragmentActivity() {
                     }
                     "shareFile" -> {
                         val file = File(call.argument<String>("path")!!)
-                        val uri = FileProvider.getUriForFile(this, "com.imtaqin.andropi.files", file)
+                        val uri = FileProvider.getUriForFile(this, "$packageName.files", file)
                         val send = Intent(Intent.ACTION_SEND).apply {
                             type = mimeOf(file.name)
                             putExtra(Intent.EXTRA_STREAM, uri)
@@ -158,6 +158,31 @@ class MainActivity : FlutterFragmentActivity() {
                     "openUrl" -> {
                         startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(call.arguments as String)))
                         result.success(null)
+                    }
+                    // Self-update: hand a downloaded APK to the system installer.
+                    "installApk" -> {
+                        try {
+                            val file = File(call.arguments as String)
+                            if (!packageManager.canRequestPackageInstalls()) {
+                                startActivity(
+                                    Intent(
+                                        Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                        Uri.parse("package:$packageName"),
+                                    ),
+                                )
+                                result.success("needs-permission")
+                            } else {
+                                val uri = FileProvider.getUriForFile(this, "$packageName.files", file)
+                                val view = Intent(Intent.ACTION_VIEW).apply {
+                                    setDataAndType(uri, "application/vnd.android.package-archive")
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                                }
+                                startActivity(view)
+                                result.success("launched")
+                            }
+                        } catch (e: Exception) {
+                            result.error("install_failed", e.message, null)
+                        }
                     }
                     // Voice input through the system recognizer (no mic permission needed here).
                     "listen" -> {
@@ -183,7 +208,7 @@ class MainActivity : FlutterFragmentActivity() {
                     "notify" -> {
                         notify(
                             call.argument<Int>("id") ?: 100,
-                            call.argument<String>("title") ?: "AndroPI",
+                            call.argument<String>("title") ?: "CoderRa",
                             call.argument<String>("body") ?: "",
                         )
                         result.success(null)
@@ -297,23 +322,23 @@ class MainActivity : FlutterFragmentActivity() {
         MimeTypeMap.getSingleton().getMimeTypeFromExtension(name.substringAfterLast('.', "").lowercase())
             ?: "application/octet-stream"
 
-    /** Copies a file into Download/AndroPI and returns where it went. MediaStore needs no storage permission. */
+    /** Copies a file into Download/CoderRa and returns where it went. MediaStore needs no storage permission. */
     private fun saveToDownloads(file: File): String {
         if (Build.VERSION.SDK_INT >= 29) {
             val values = ContentValues().apply {
                 put(MediaStore.Downloads.DISPLAY_NAME, file.name)
                 put(MediaStore.Downloads.MIME_TYPE, mimeOf(file.name))
-                put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/AndroPI")
+                put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/CoderRa")
             }
             val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
                 ?: throw IllegalStateException("Could not create the download")
             contentResolver.openOutputStream(uri)!!.use { out -> file.inputStream().use { it.copyTo(out) } }
         } else {
             @Suppress("DEPRECATION")
-            val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "AndroPI")
+            val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "CoderRa")
             dir.mkdirs()
             file.copyTo(File(dir, file.name), overwrite = true)
         }
-        return "Download/AndroPI/${file.name}"
+        return "Download/CoderRa/${file.name}"
     }
 }

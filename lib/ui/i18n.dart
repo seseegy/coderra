@@ -48,9 +48,12 @@ const _id = <String, String>{
   // Settings
   'AI': 'AI',
   'About': 'Tentang',
+  'App updates': 'Pembaruan aplikasi',
   'Made by': 'Dibuat oleh',
   'Developer from Bogor, Indonesia. Builds AndroPI, security tools, bots and scrapers.':
       'Developer dari Bogor, Indonesia. Bikin AndroPI, tool security, bot, dan scraper.',
+  'Forked and modified by Rosyid. CoderRa adds custom providers, Search1API web tools, free Zelai models and more on top of AndroPI.':
+      'Di-fork dan dimodifikasi oleh Rosyid. CoderRa menambahkan custom provider, tool web Search1API, model gratis Zelai, dan lainnya di atas AndroPI.',
   'Repositories': 'Repositori',
   'Accounts & servers': 'Akun & server',
   'Appearance': 'Tampilan',
@@ -93,7 +96,7 @@ const _id = <String, String>{
   'Backup & restore': 'Cadangkan & pulihkan',
   'Chats, settings, skills and keys in one file': 'Chat, pengaturan, skill, dan kunci dalam satu file',
   'App lock': 'Kunci aplikasi',
-  'Fingerprint or screen lock when opening AndroPI': 'Sidik jari atau kunci layar saat membuka AndroPI',
+  'Fingerprint or screen lock when opening CoderRa': 'Sidik jari atau kunci layar saat membuka CoderRa',
   'Text size': 'Ukuran teks',
   'Compact layout': 'Tata letak ringkas',
   'Tighter spacing, more on screen': 'Jarak lebih rapat, lebih banyak konten',
@@ -104,9 +107,9 @@ const _id = <String, String>{
   'Large': 'Besar',
   'Huge': 'Sangat besar',
   // Lock screen
-  'AndroPI is locked': 'AndroPI terkunci',
+  'CoderRa is locked': 'CoderRa terkunci',
   'Unlock': 'Buka kunci',
-  'Unlock AndroPI': 'Buka kunci AndroPI',
+  'Unlock CoderRa': 'Buka kunci CoderRa',
   'No screen lock is set on this phone.': 'Belum ada kunci layar di HP ini.',
   // Chat
   'Attach': 'Lampirkan',

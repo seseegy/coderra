@@ -147,7 +147,7 @@ class _SessionsDrawerState extends State<SessionsDrawer> {
                             children: [
                               const LogoMark(size: 30, glow: false),
                               const SizedBox(width: 10),
-                              Text('AndroPI', style: text.titleLarge),
+                              Text('CoderRa', style: text.titleLarge),
                               const Spacer(),
                               IconButton(
                                 tooltip: 'Accounts & servers',

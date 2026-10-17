@@ -227,7 +227,7 @@ class _SkillsScreenState extends State<SkillsScreen> {
                         leading: _SkillIcon(builtin: s.builtin, origin: s.source),
                         title: s.name,
                         subtitle: s.description,
-                        trailing: s.builtin ? Pill('AndroPI', color: p.accent) : null,
+                        trailing: s.builtin ? Pill('CoderRa', color: p.accent) : null,
                         onTap: () => _open(s),
                       ),
                   ],

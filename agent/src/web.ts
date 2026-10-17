@@ -131,8 +131,9 @@ async function s1Crawl(url: string, keys: string[], signal?: AbortSignal) {
 // ---------------------------------------------------------------------------
 // Search backends
 
-async function braveSearch(q: string, n: number, key: string, signal?: AbortSignal): Promise<SearchResult[]> {
-	const res = await fetch(`https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(q)}&count=${n}`, {
+async function braveSearch(q: string, n: number, key: string, signal?: AbortSignal, days?: number): Promise<SearchResult[]> {
+	const freshness = days ? `&freshness=${days <= 1 ? "pd" : days <= 7 ? "pw" : days <= 31 ? "pm" : "py"}` : "";
+	const res = await fetch(`https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(q)}&count=${n}${freshness}`, {
 		headers: { Accept: "application/json", "X-Subscription-Token": key },
 		signal,
 	});
@@ -145,11 +146,24 @@ async function braveSearch(q: string, n: number, key: string, signal?: AbortSign
 	}));
 }
 
-async function tavilySearch(q: string, n: number, key: string, signal?: AbortSignal): Promise<SearchResult[]> {
+async function tavilySearch(
+	q: string,
+	n: number,
+	key: string,
+	signal?: AbortSignal,
+	opts?: { site?: string; days?: number },
+): Promise<SearchResult[]> {
 	const res = await fetch("https://api.tavily.com/search", {
 		method: "POST",
 		headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-		body: JSON.stringify({ query: q, max_results: n }),
+		body: JSON.stringify({
+			query: q,
+			max_results: n,
+			...(opts?.site ? { include_domains: [opts.site] } : {}),
+			...(opts?.days
+				? { time_range: opts.days <= 1 ? "day" : opts.days <= 7 ? "week" : opts.days <= 30 ? "month" : "year" }
+				: {}),
+		}),
 		signal,
 	});
 	if (!res.ok) throw new Error(`Tavily ${res.status}`);
@@ -231,15 +245,24 @@ async function braveHtmlSearch(q: string, n: number, signal?: AbortSignal): Prom
 	return out;
 }
 
-export async function webSearch(q: string, n: number, keys: SearchKeys, signal?: AbortSignal) {
+export interface SearchOpts {
+	/** Restrict results to one domain, e.g. "developer.mozilla.org". */
+	site?: string;
+	/** Only recent results, in days. Honored by Brave and Tavily; other engines ignore it. */
+	days?: number;
+}
+
+export async function webSearch(q: string, n: number, keys: SearchKeys, signal?: AbortSignal, opts?: SearchOpts) {
+	// Query-operator form for the engines without a native domain filter.
+	const qSite = opts?.site ? `${q} site:${opts.site}` : q;
 	const attempts: [string, () => Promise<SearchResult[]>][] = [];
-	if (keys.search1api?.length) attempts.push(["search1api", () => s1Search(q, n, keys.search1api!, signal)]);
-	if (keys.brave) attempts.push(["brave", () => braveSearch(q, n, keys.brave!, signal)]);
-	if (keys.tavily) attempts.push(["tavily", () => tavilySearch(q, n, keys.tavily!, signal)]);
+	if (keys.search1api?.length) attempts.push(["search1api", () => s1Search(qSite, n, keys.search1api!, signal)]);
+	if (keys.brave) attempts.push(["brave", () => braveSearch(qSite, n, keys.brave!, signal, opts?.days)]);
+	if (keys.tavily) attempts.push(["tavily", () => tavilySearch(q, n, keys.tavily!, signal, opts)]);
 	attempts.push(
-		["duckduckgo", () => duckSearch(q, n, signal)],
-		["duckduckgo-lite", () => duckLiteSearch(q, n, signal)],
-		["brave", () => braveHtmlSearch(q, n, signal)],
+		["duckduckgo", () => duckSearch(qSite, n, signal)],
+		["duckduckgo-lite", () => duckLiteSearch(qSite, n, signal)],
+		["brave", () => braveHtmlSearch(qSite, n, signal)],
 	);
 	const errors: string[] = [];
 	for (const [name, attempt] of attempts) {
@@ -250,7 +273,9 @@ export async function webSearch(q: string, n: number, keys: SearchKeys, signal?:
 			errors.push(`${name}: ${(e as Error).message}`);
 		}
 	}
-	throw new Error(`Search failed (${errors.join("; ")})`);
+	throw new Error(
+		`All search providers failed (${errors.join("; ")}). Check the connection — with a VPN on, set the app DNS to System — or add a Search1API or Brave key under Network settings.`,
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -336,7 +361,7 @@ export function webTools(keys: () => SearchKeys) {
 			name: "web_search",
 			label: "Web search",
 			description:
-				"Search the web. Use it to find install instructions, documentation, package names, API usage, and fixes for errors instead of guessing. Returns titles, URLs and snippets; follow up with web_fetch to read a page.",
+				"Search the web. Use it to find install instructions, documentation, package names, API usage, and fixes for errors instead of guessing. Returns titles, URLs and snippets; follow up with web_fetch to read a page. Optional: `site` restricts results to one domain (all engines); `days` limits recency (Brave and Tavily only, ignored elsewhere).",
 			promptSnippet: "web_search: search the web for docs, install steps, and error fixes",
 			promptGuidelines: [
 				"When unsure how to install or use something, or an error is unfamiliar, use web_search and then web_fetch the most relevant result before acting.",
@@ -344,13 +369,21 @@ export function webTools(keys: () => SearchKeys) {
 			parameters: Type.Object({
 				query: Type.String({ description: "Search query" }),
 				count: Type.Optional(Type.Number({ description: "Number of results (default 8, max 20)" })),
+				site: Type.Optional(Type.String({ description: "Only return results from this domain, e.g. developer.mozilla.org" })),
+				days: Type.Optional(Type.Number({ description: "Only results from the last N days (Brave/Tavily only)" })),
 			}),
-			async execute(_id: string, params: { query: string; count?: number }, signal?: AbortSignal) {
+			async execute(
+				_id: string,
+				params: { query: string; count?: number; site?: string; days?: number },
+				signal?: AbortSignal,
+			) {
 				// Models trained on other search tools often send numResults/limit instead.
 				const alt = params as any;
 				const requested = Number(params.count ?? alt.numResults ?? alt.num_results ?? alt.limit ?? 8) || 8;
 				const n = Math.min(Math.max(requested, 1), 20);
-				const { engine, results } = await webSearch(params.query, n, keys(), signal);
+				const site = typeof params.site === "string" ? params.site.replace(/^https?:\/\//, "").split("/")[0] || undefined : undefined;
+				const days = params.days && params.days > 0 ? Math.floor(params.days) : undefined;
+				const { engine, results } = await webSearch(params.query, n, keys(), signal, { site, days });
 				const body = results
 					.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}${r.snippet ? `\n   ${r.snippet}` : ""}`)
 					.join("\n\n");

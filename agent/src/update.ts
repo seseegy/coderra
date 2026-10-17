@@ -1,0 +1,164 @@
+/**
+ * In-app update check for CoderRa (fork addition).
+ *
+ * CI publishes every main build as a GitHub Release tagged `b<run number>`
+ * in seseegy/coderra and builds the APK with --build-number=<run number>,
+ * so comparing numbers is enough. The running build reaches the host as
+ * ANDROPI_APP_BUILD / ANDROPI_APP_VERSION (set by AgentRuntime from the
+ * package manager). The check needs the user's GitHub sign-in because the
+ * repository is private, and successful lookups are cached for 6 hours in
+ * <agentDir>/andropi/update-check.json so opening Settings stays cheap.
+ */
+import { createWriteStream, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+
+const REPO = "seseegy/coderra";
+const CACHE_MS = 6 * 3600_000;
+
+export interface UpdateCheck {
+	status: "available" | "current" | "none" | "signed-out" | "error";
+	currentBuild: number;
+	currentVersion: string;
+	latestBuild?: number;
+	tag?: string;
+	title?: string;
+	url?: string;
+	assetName?: string;
+	assetSize?: number;
+	message?: string;
+}
+
+/** The release APK asset: prefer the arm64 build, else the first APK. */
+function pickAsset(rel: any): { id: number; name: string; size: number } | null {
+	const assets = Array.isArray(rel?.assets) ? rel.assets : [];
+	const apks = assets.filter(
+		(a: any) => typeof a?.name === "string" && a.name.endsWith(".apk") && typeof a?.id === "number",
+	);
+	const pick = apks.find((a: any) => a.name.includes("arm64")) ?? apks[0];
+	return pick ? { id: pick.id, name: pick.name, size: Number(pick.size) || 0 } : null;
+}
+
+export async function checkAppUpdate(
+	agentDir: string,
+	githubApi: (path: string) => Promise<any>,
+	force = false,
+): Promise<UpdateCheck> {
+	const currentBuild = Number.parseInt(process.env.ANDROPI_APP_BUILD ?? "", 10) || 0;
+	const currentVersion = process.env.ANDROPI_APP_VERSION ?? "";
+	const base = { currentBuild, currentVersion };
+	const stateDir = join(agentDir, "andropi");
+	const cacheFile = join(stateDir, "update-check.json");
+
+	if (!force) {
+		try {
+			const c = JSON.parse(readFileSync(cacheFile, "utf8"));
+			if (Date.now() - Number(c.at ?? 0) < CACHE_MS && c.result) {
+				return { ...c.result, ...base };
+			}
+		} catch {
+			// No (readable) cache yet.
+		}
+	}
+
+	let result: UpdateCheck;
+	try {
+		const rel = await githubApi(`/repos/${REPO}/releases/latest`);
+		const tag = String(rel?.tag_name ?? "");
+		const latestBuild = Number.parseInt(tag.replace(/^b/, ""), 10) || 0;
+		const asset = pickAsset(rel);
+		result = {
+			...base,
+			status: latestBuild > currentBuild ? "available" : "current",
+			latestBuild,
+			tag,
+			title: typeof rel?.name === "string" ? rel.name : tag,
+			url: typeof rel?.html_url === "string" ? rel.html_url : "",
+			...(asset ? { assetName: asset.name, assetSize: asset.size } : {}),
+		};
+	} catch (e: any) {
+		if (e?.status === 404) result = { ...base, status: "none" };
+		else if (/not signed in/i.test(String(e?.message ?? e))) result = { ...base, status: "signed-out" };
+		else result = { ...base, status: "error", message: String(e?.message ?? e).slice(0, 160) };
+	}
+
+	// Only cache real answers; a sign-in or a network blip must not stick
+	// around for six hours.
+	if (result.status === "available" || result.status === "current" || result.status === "none") {
+		try {
+			mkdirSync(stateDir, { recursive: true });
+			writeFileSync(cacheFile, JSON.stringify({ at: Date.now(), result }));
+		} catch {
+			// Cache is best-effort.
+		}
+	}
+	return result;
+}
+
+// ---------------------------------------------------------------------------
+// Direct APK download: the app fetches the release asset itself (with the
+// user's GitHub token, since the repo is private) so an update never has
+// to leave the app. The file lands in <agentDir>/updates, which is inside
+// filesDir and therefore servable by the app's FileProvider installer.
+
+export interface UpdateDownload {
+	state: "downloading" | "done" | "error";
+	received: number;
+	total: number;
+	path?: string;
+	tag?: string;
+	message?: string;
+}
+
+const downloads = new Map<string, UpdateDownload>();
+let downloadSeq = 0;
+
+export async function startAppUpdateDownload(
+	agentDir: string,
+	githubApi: (path: string) => Promise<any>,
+	githubRaw: (path: string, init?: RequestInit) => Promise<Response>,
+): Promise<{ id: string; name: string; size: number; tag: string }> {
+	const rel = await githubApi(`/repos/${REPO}/releases/latest`);
+	const asset = pickAsset(rel);
+	if (!asset) throw new Error("The latest release has no APK attached");
+	const tag = String(rel?.tag_name ?? "b0");
+	const dir = join(agentDir, "updates");
+	mkdirSync(dir, { recursive: true });
+	const file = join(dir, `${tag}-${asset.name}`);
+	const id = `u${++downloadSeq}`;
+	const rec: UpdateDownload = { state: "downloading", received: 0, total: asset.size, tag };
+	downloads.set(id, rec);
+	void (async () => {
+		try {
+			const res = await githubRaw(`/repos/${REPO}/releases/assets/${asset.id}`, {
+				headers: { Accept: "application/octet-stream" },
+			});
+			if (!res.ok || !res.body) throw new Error(`GitHub download failed (${res.status})`);
+			const source = Readable.fromWeb(res.body as any);
+			source.on("data", (chunk: Buffer) => {
+				rec.received += chunk.length;
+			});
+			await pipeline(source, createWriteStream(file));
+			const size = statSync(file).size;
+			if (asset.size && size !== asset.size) {
+				throw new Error(`Download incomplete (${size} of ${asset.size} bytes)`);
+			}
+			rec.state = "done";
+			rec.path = file;
+		} catch (e: any) {
+			rec.state = "error";
+			rec.message = String(e?.message ?? e).slice(0, 200);
+			try {
+				unlinkSync(file);
+			} catch {
+				// Partial file may not exist.
+			}
+		}
+	})();
+	return { id, name: asset.name, size: asset.size, tag };
+}
+
+export function appUpdateDownloadStatus(id: string): UpdateDownload {
+	return downloads.get(id) ?? { state: "error", received: 0, total: 0, message: "Unknown download" };
+}

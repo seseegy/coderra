@@ -85,6 +85,10 @@ object AgentRuntime {
             "TERM" to "dumb",
             "LANG" to "en_US.UTF-8",
             "PI_SKIP_VERSION_CHECK" to "1",
+            // The running build, so the host can check for CoderRa updates:
+            // CI sets versionCode = Actions run number (--build-number).
+            "ANDROPI_APP_BUILD" to appBuildNumber(context).toString(),
+            "ANDROPI_APP_VERSION" to appVersionName(context),
             // AndroPI sends no telemetry; keep pi's install ping off even if a future version bundles it.
             "PI_TELEMETRY" to "0",
             "NODE_OPTIONS" to "--max-old-space-size=1024",
@@ -109,6 +113,20 @@ object AgentRuntime {
             env["CURL_CA_BUNDLE"] = caFile.path
         }
         return env
+    }
+
+    private fun appBuildNumber(context: Context): Long = try {
+        val info = context.packageManager.getPackageInfo(context.packageName, 0)
+        if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode
+        else @Suppress("DEPRECATION") info.versionCode.toLong()
+    } catch (e: Exception) {
+        0
+    }
+
+    private fun appVersionName(context: Context): String = try {
+        context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: ""
+    } catch (e: Exception) {
+        ""
     }
 
     @Synchronized
