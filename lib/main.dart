@@ -24,7 +24,7 @@ class AndroPiApp extends StatelessWidget {
     return ListenableBuilder(
       listenable: appearance,
       builder: (context, _) => MaterialApp(
-        title: 'AndroPI',
+        title: 'CoderRa',
         debugShowCheckedModeBanner: false,
         themeMode: appearance.value,
         theme: buildTheme(Brightness.light),

@@ -31,7 +31,7 @@ android {
                 abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86_64")
             }
         }
-        applicationId = "com.imtaqin.andropi"
+        applicationId = "id.coderra.app"
         minSdk = 26
         targetSdk = flutter.targetSdkVersion
         // Uses the version code from pubspec.yaml. When using split APKs, 1000 * ABI_VERSION

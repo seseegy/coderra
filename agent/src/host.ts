@@ -261,7 +261,7 @@ function ensureAgentsFile() {
 	const path = join(agentDir, "AGENTS.md");
 	if (existsSync(path)) {
 		const current = readFileSync(path, "utf8");
-		const ours = current.includes(AGENTS_MARKER) || current.startsWith("# Environment\n\nYou are running inside AndroPI");
+		const ours = current.includes(AGENTS_MARKER) || current.startsWith("# Environment\n\nYou are running inside AndroPI") || current.startsWith("# Environment\n\nYou are running inside CoderRa");
 		if (!ours) return;
 	}
 	writeFileSync(
@@ -269,7 +269,7 @@ function ensureAgentsFile() {
 		`${AGENTS_MARKER}
 # Environment
 
-You are running inside AndroPI, an Android app, on the user's phone.
+You are running inside CoderRa, an Android app, on the user's phone.
 
 - The shell is Android's /system/bin/sh (mksh) with toybox utilities, not bash.
   Prefer POSIX sh syntax. There is no sudo, apt or pkg.
