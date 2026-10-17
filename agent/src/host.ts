@@ -581,6 +581,72 @@ async function fetchCustomProviderModels(cmd: Command) {
 	return { models };
 }
 
+/** Catalog of the built-in free provider, as listed by its /models endpoint
+ * when the seed was written. glm-4.7 comes first: it is the model the
+ * gateway itself recommends and the one verified to answer. The list is a
+ * starting point — the user can refresh it with Fetch in the edit form. */
+const ZELAI_FREE_MODELS = [
+	"glm-4.7",
+	"big-pickle",
+	"beam-free",
+	"mimo-v2.6-flash-free",
+	"nemotron-3.5-super-vl-free",
+	"nemotron-3.5-lightning-free",
+	"longcat-2.5-preview-free",
+	"deepseek-v4.1-flash-free",
+	"glm-5.3-flash-free",
+	"space-bunny-free",
+	"gemini-1.5-pro-free",
+	"minimax-m2.7-free",
+	"ciora-coding-free",
+	"ciora-ai-free",
+	"ciora-vision-free",
+	"z-image-turbo",
+	"qwen2.5-1.5b-instruct-free",
+	"phi-3.5-mini-free",
+	"smollm2-1.7b-instruct-free",
+	"tinyllama-1.1b-free",
+];
+
+const seededFreeProvidersPath = join(stateDir, "seeded-free-providers.json");
+
+function readSeededFreeProviders(): string[] {
+	try {
+		const parsed = JSON.parse(readFileSync(seededFreeProvidersPath, "utf8"));
+		if (Array.isArray(parsed)) return parsed.filter((x): x is string => typeof x === "string");
+	} catch {
+		// Nothing seeded yet.
+	}
+	return [];
+}
+
+/** Seeds the built-in free provider (Zelai's keyless OpenAI-compatible
+ * gateway) into models.json exactly like a user-added custom provider, so
+ * it can be edited or deleted from Settings. Seeding happens once: the
+ * marker file keeps a deleted provider deleted. Must run before
+ * ModelRuntime.create() so the runtime picks the provider up. */
+function seedFreeProviders() {
+	const seeded = readSeededFreeProviders();
+	if (seeded.includes("zelai-free")) return;
+	const config = readModelsJson();
+	if (!config.providers["zelai-free"]) {
+		config.providers["zelai-free"] = {
+			name: "Zelai (Free)",
+			baseUrl: "https://ai.zelai.qzz.io/v1",
+			api: "openai-completions",
+			// The gateway needs no account key, but pi refuses to use a
+			// provider that has none — this placeholder is simply ignored
+			// by the gateway.
+			apiKey: "zelai",
+			models: ZELAI_FREE_MODELS.map((id) => ({ id })),
+		};
+		writeModelsJson(config);
+		const registry = readCustomProviderIds();
+		if (!registry.includes("zelai-free")) writeCustomProviderIds([...registry, "zelai-free"]);
+	}
+	writeFileSync(seededFreeProvidersPath, `${JSON.stringify([...seeded, "zelai-free"], null, 2)}\n`);
+}
+
 async function deleteCustomProvider(cmd: Command) {
 	const id = String(cmd.provider ?? "");
 	const registry = readCustomProviderIds();
@@ -1071,6 +1137,13 @@ async function main() {
 	checkpoints = new Checkpoints(join(stateDir, "checkpoints"));
 	container = new Container(process.env.ANDROPI_FILES ?? join(agentDir, "..", "..", ".."));
 	mcp = new Mcp(join(stateDir, "mcp.json"), () => send({ type: "mcp", servers: mcp.summary() }));
+	// The built-in free provider must be in models.json before the runtime
+	// loads it; a seed failure must never block startup.
+	try {
+		seedFreeProviders();
+	} catch (e) {
+		log("free provider seed failed:", e);
+	}
 	modelRuntime = await ModelRuntime.create();
 	settingsManager = SettingsManager.create(workspace, agentDir);
 	// Linux container is the agent's shell by default once installed.
