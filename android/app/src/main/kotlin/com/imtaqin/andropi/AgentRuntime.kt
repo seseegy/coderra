@@ -86,7 +86,8 @@ object AgentRuntime {
             "LANG" to "en_US.UTF-8",
             "PI_SKIP_VERSION_CHECK" to "1",
             // The running build, so the host can check for CoderRa updates:
-            // CI sets versionCode = Actions run number (--build-number).
+            // CI passes the Actions run number as --build-number; `--split-per-abi` then adds an
+            // ABI offset (multiples of 1000) to versionCode, which appBuildNumber() strips.
             "ANDROPI_APP_BUILD" to appBuildNumber(context).toString(),
             "ANDROPI_APP_VERSION" to appVersionName(context),
             // AndroPI sends no telemetry; keep pi's install ping off even if a future version bundles it.
@@ -115,10 +116,16 @@ object AgentRuntime {
         return env
     }
 
+    /**
+     * The CI run number. Flutter's split-per-abi adds 1000 (armeabi-v7a), 2000 (arm64-v8a) or
+     * 4000 (x86_64) to versionCode, so the remainder mod 1000 is the run number. Holds while
+     * run numbers stay below 1000; the update check compares it with the `b<run>` release tag.
+     */
     private fun appBuildNumber(context: Context): Long = try {
         val info = context.packageManager.getPackageInfo(context.packageName, 0)
-        if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode
+        val code = if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode
         else @Suppress("DEPRECATION") info.versionCode.toLong()
+        code % 1000
     } catch (e: Exception) {
         0
     }
