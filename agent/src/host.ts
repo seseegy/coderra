@@ -346,6 +346,7 @@ async function providers() {
 			custom: !!entry,
 			baseUrl: entry?.baseUrl ?? null,
 			customModel: entry?.models?.[0]?.id ?? null,
+			customModels: entry?.models ?? [],
 		});
 	}
 	// A managed provider the runtime failed to load (e.g. a hand-edited
@@ -365,6 +366,7 @@ async function providers() {
 			custom: true,
 			baseUrl: entry.baseUrl ?? null,
 			customModel: entry.models?.[0]?.id ?? null,
+			customModels: entry.models ?? [],
 		});
 	}
 	return out;
@@ -418,9 +420,59 @@ async function refreshProvider(id: string) {
 	await modelRuntime.refresh({ providers: [id], allowNetwork: false });
 }
 
+type CustomModelInput = {
+	id: string;
+	name?: string;
+	contextWindow?: number;
+	maxTokens?: number;
+	reasoning?: boolean;
+	vision?: boolean;
+};
+
+function positiveInt(v: any): number | undefined {
+	const n = typeof v === "string" ? Number(v) : v;
+	return typeof n === "number" && Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+}
+
+/** Normalizes one model descriptor (from the app, or a /models entry already
+ * mapped by fetchCustomProviderModels) into a models.json model entry. Only
+ * metadata pi understands is carried over; ids are the only required part. */
+function customModelEntry(input: any): Record<string, any> | null {
+	const raw = typeof input === "string" ? { id: input } : input;
+	if (!raw || typeof raw !== "object") return null;
+	const id = String(raw.id ?? "").trim();
+	if (!id) return null;
+	const entry: Record<string, any> = { id };
+	const name = typeof raw.name === "string" ? raw.name.trim() : "";
+	if (name && name !== id) entry.name = name;
+	if (raw.reasoning === true) entry.reasoning = true;
+	if (raw.vision === true || (Array.isArray(raw.input) && raw.input.includes("image"))) {
+		entry.input = ["text", "image"];
+	}
+	const contextWindow = positiveInt(raw.contextWindow);
+	if (contextWindow) entry.contextWindow = contextWindow;
+	const maxTokens = positiveInt(raw.maxTokens);
+	if (maxTokens) entry.maxTokens = maxTokens;
+	return entry;
+}
+
+/** The model list for a save: cmd.models (many) or legacy cmd.model (one). */
+function customModelEntries(cmd: Command): Record<string, any>[] {
+	const rawList = Array.isArray(cmd.models) ? cmd.models : cmd.model != null ? [cmd.model] : [];
+	const seen = new Set<string>();
+	const out: Record<string, any>[] = [];
+	for (const item of rawList) {
+		const entry = customModelEntry(item);
+		if (!entry || seen.has(entry.id)) continue;
+		seen.add(entry.id);
+		out.push(entry);
+		if (out.length >= 500) break;
+	}
+	return out;
+}
+
 async function saveCustomProvider(cmd: Command) {
 	const name = String(cmd.name ?? "").trim();
-	const modelId = String(cmd.model ?? "").trim();
 	const apiKey = String(cmd.apiKey ?? "").trim();
 	const rawBaseUrl = String(cmd.baseUrl ?? "").trim();
 	const id = String(cmd.provider ?? "").trim().toLowerCase();
@@ -428,7 +480,8 @@ async function saveCustomProvider(cmd: Command) {
 	if (!/^[a-z0-9][a-z0-9_-]*$/.test(id)) {
 		throw new Error("Provider name must start with a letter or digit and use only letters, digits, - or _");
 	}
-	if (!modelId) throw new Error("Model ID is empty");
+	const models = customModelEntries(cmd);
+	if (models.length === 0) throw new Error("Add at least one model ID");
 	let url: URL;
 	try {
 		url = new URL(rawBaseUrl);
@@ -453,12 +506,79 @@ async function saveCustomProvider(cmd: Command) {
 		baseUrl,
 		api: "openai-completions",
 		apiKey: key,
-		models: [{ id: modelId }],
+		models,
 	};
 	writeModelsJson(config);
 	if (!isOurs) writeCustomProviderIds([...registry, id]);
 	await refreshProvider(id);
 	return providers();
+}
+
+/** Maps one entry of an OpenAI-style GET /models response to the descriptor
+ * shape the app passes back on save. Gateways expose the metadata under
+ * different keys (see e.g. GripHub's response), so accept the common
+ * spellings and keep only what pi can use. */
+function fetchedModel(raw: any): CustomModelInput | null {
+	if (!raw || typeof raw !== "object") return null;
+	const id = String(raw.id ?? "").trim();
+	if (!id) return null;
+	const caps = raw.capabilities && typeof raw.capabilities === "object" ? raw.capabilities : {};
+	const out: CustomModelInput = { id };
+	const name = typeof raw.name === "string" ? raw.name.trim() : "";
+	if (name && name !== id) out.name = name;
+	const contextWindow = positiveInt(raw.context_window ?? raw.contextWindow ?? caps.contextWindow ?? caps.context_window);
+	if (contextWindow) out.contextWindow = contextWindow;
+	const maxTokens = positiveInt(raw.max_output_tokens ?? raw.maxTokens ?? caps.maxOutput ?? caps.max_output_tokens);
+	if (maxTokens) out.maxTokens = maxTokens;
+	if (caps.reasoning === true || raw.reasoning === true) out.reasoning = true;
+	if (caps.vision === true) out.vision = true;
+	return out;
+}
+
+/** Fetches the model catalog of an OpenAI-compatible endpoint so the app can
+ * offer it as a checklist instead of making the user type every model ID.
+ * A blank key falls back to the one stored for cmd.provider (edit flow). */
+async function fetchCustomProviderModels(cmd: Command) {
+	const rawBaseUrl = String(cmd.baseUrl ?? "").trim();
+	let url: URL;
+	try {
+		url = new URL(rawBaseUrl);
+	} catch {
+		throw new Error("Base URL is not a valid URL");
+	}
+	if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Base URL must start with http:// or https://");
+	const baseUrl = rawBaseUrl.replace(/\/+$/, "");
+	let apiKey = String(cmd.apiKey ?? "").trim();
+	if (!apiKey && cmd.provider) {
+		const existing = readModelsJson().providers[String(cmd.provider)];
+		if (typeof existing?.apiKey === "string") apiKey = existing.apiKey;
+	}
+	let res: Response;
+	try {
+		res = await fetch(`${baseUrl}/models`, {
+			headers: {
+				Accept: "application/json",
+				...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+			},
+			signal: AbortSignal.timeout(20000),
+		});
+	} catch (e: any) {
+		throw new Error(`Could not reach ${baseUrl}/models: ${e?.cause?.message ?? e?.message ?? e}`);
+	}
+	if (!res.ok) throw new Error(`Model list request failed: HTTP ${res.status}`);
+	const body: any = await res.json().catch(() => null);
+	const list = Array.isArray(body) ? body : Array.isArray(body?.data) ? body.data : Array.isArray(body?.models) ? body.models : null;
+	if (!list) throw new Error("The endpoint did not return a model list");
+	const seen = new Set<string>();
+	const models: CustomModelInput[] = [];
+	for (const raw of list) {
+		const m = fetchedModel(raw);
+		if (!m || seen.has(m.id)) continue;
+		seen.add(m.id);
+		models.push(m);
+	}
+	if (models.length === 0) throw new Error("The endpoint returned no models");
+	return { models };
 }
 
 async function deleteCustomProvider(cmd: Command) {
@@ -625,6 +745,8 @@ async function handle(cmd: Command): Promise<unknown> {
 			return providers();
 		case "custom_provider_save":
 			return saveCustomProvider(cmd);
+		case "custom_provider_fetch_models":
+			return fetchCustomProviderModels(cmd);
 		case "custom_provider_delete":
 			return deleteCustomProvider(cmd);
 
