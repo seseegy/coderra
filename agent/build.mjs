@@ -51,6 +51,10 @@ function prune(dir) {
 	}
 }
 prune(join(stage, "node_modules"));
+// The .bin shims symlink into pi's dist/bundle, which prune() just removed;
+// the dangling links make minify's statSync throw on Linux/macOS. They are
+// not needed inside the app bundle, so drop them before minifying.
+rmSync(join(stage, "node_modules", ".bin"), { recursive: true, force: true });
 
 // The host imports pi's SDK entry (dist/index.js); the CLI's prebuilt bundle and the docs are never loaded.
 const piDir = join(stage, "node_modules", "@earendil-works", "pi-coding-agent");
