@@ -222,6 +222,35 @@ class AgentController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Saves an OpenAI-compatible custom provider (base URL + API key + one
+  /// model ID) in the agent's models.json. An empty [apiKey] while editing
+  /// keeps the stored key.
+  Future<void> saveCustomProvider({
+    required String id,
+    required String name,
+    required String baseUrl,
+    required String apiKey,
+    required String modelId,
+  }) async {
+    await client.call('custom_provider_save', {
+      'provider': id,
+      'name': name,
+      'baseUrl': baseUrl,
+      'apiKey': apiKey,
+      'model': modelId,
+    });
+    await refreshProviders();
+    notifyListeners();
+  }
+
+  /// Removes a custom provider and its stored API key.
+  Future<void> deleteCustomProvider(String provider) async {
+    await client.call('custom_provider_delete', {'provider': provider});
+    await refreshProviders();
+    _applyState(await client.call<Map<String, dynamic>>('state'));
+    notifyListeners();
+  }
+
   // -------------------------------------------------------------------------
   // Event handling
 
