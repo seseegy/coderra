@@ -95,6 +95,84 @@ class _FolderPickerState extends State<FolderPicker> with WidgetsBindingObserver
     }
   }
 
+  /// Deletes a project folder from the workspace, permanently.
+  ///
+  /// Only offered for folders inside the workspace (never phone storage and
+  /// never the workspace root itself). The folder the active session is
+  /// working in — or any folder containing it — is refused.
+  Future<void> _deleteProject(Directory dir) async {
+    final name = folderName(dir.path);
+    final cwd = widget.agent.cwd;
+    if (cwd == dir.path || cwd.startsWith('${dir.path}/')) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('That project is in use by the current chat. Switch chats before deleting it.')),
+      );
+      return;
+    }
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete project?'),
+        content: Text(
+          '"$name" and everything inside it will be deleted from the workspace. This cannot be undone.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: TextButton.styleFrom(foregroundColor: context.palette.danger),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      await dir.delete(recursive: true);
+      widget.agent.integrations.refreshProjects().catchError((_) {});
+      if (mounted) {
+        setState(() {});
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Project "$name" deleted')));
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not delete it: $e')));
+    }
+  }
+
+  /// Actions for one listed folder: open it, or (in the workspace) delete it.
+  Future<void> _folderActions(Directory dir) async {
+    final canDelete = root == _Root.workspace;
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(LucideIcons.folderOpen, size: 20),
+              title: Text('Open ${folderName(dir.path)}'),
+              onTap: () => Navigator.of(context).pop('open'),
+            ),
+            if (canDelete)
+              ListTile(
+                leading: Icon(LucideIcons.trash2, size: 20, color: context.palette.danger),
+                title: Text('Delete project', style: TextStyle(color: context.palette.danger)),
+                subtitle: const Text('Removes the folder and everything inside it from the workspace'),
+                onTap: () => Navigator.of(context).pop('delete'),
+              ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    if (action == 'open') {
+      setState(() => path = dir.path);
+    } else if (action == 'delete') {
+      await _deleteProject(dir);
+    }
+  }
+
   Future<void> _newFolder() async {
     final controller = TextEditingController();
     final name = await showDialog<String>(
@@ -254,8 +332,15 @@ class _FolderPickerState extends State<FolderPicker> with WidgetsBindingObserver
                         ),
                         title: Text(folderName(d.path), style: text.bodyMedium),
                         subtitle: git ? Text('git repository', style: text.bodySmall) : null,
-                        trailing: Icon(LucideIcons.chevronRight, size: 16, color: p.faint),
+                        trailing: root == _Root.workspace
+                            ? IconButton(
+                                tooltip: 'Project actions',
+                                icon: Icon(LucideIcons.ellipsisVertical, size: 18, color: p.faint),
+                                onPressed: () => _folderActions(d),
+                              )
+                            : Icon(LucideIcons.chevronRight, size: 16, color: p.faint),
                         onTap: () => setState(() => path = d.path),
+                        onLongPress: root == _Root.workspace ? () => _folderActions(d) : null,
                       );
                     },
                   ),

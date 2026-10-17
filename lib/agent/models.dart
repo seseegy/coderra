@@ -23,6 +23,12 @@ class ProviderInfo {
   bool get oauth => json['oauth'] == true;
   List<String> get methods => (json['methods'] as List? ?? const []).cast<String>();
   int get modelCount => json['models'] as int? ?? 0;
+
+  /// True for OpenAI-compatible endpoints the user added themselves
+  /// (Settings → Models & providers → Custom provider).
+  bool get custom => json['custom'] == true;
+  String? get baseUrl => json['baseUrl'] as String?;
+  String? get customModel => json['customModel'] as String?;
 }
 
 class SessionSummary {

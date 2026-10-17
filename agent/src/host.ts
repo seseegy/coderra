@@ -330,9 +330,12 @@ async function login(providerId: string, method: "api_key" | "oauth") {
 }
 
 async function providers() {
+	const custom = new Set(readCustomProviderIds());
+	const config = readModelsJson();
 	const out = [];
 	for (const p of modelRuntime.getProviders()) {
 		const auth = p.auth as any;
+		const entry = custom.has(p.id) ? config.providers[p.id] : undefined;
 		out.push({
 			id: p.id,
 			name: p.name,
@@ -340,9 +343,135 @@ async function providers() {
 			oauth: modelRuntime.isUsingOAuth(p.id),
 			methods: [auth.apiKey?.login ? "api_key" : null, auth.oauth ? "oauth" : null].filter(Boolean),
 			models: modelRuntime.getModels(p.id).length,
+			custom: !!entry,
+			baseUrl: entry?.baseUrl ?? null,
+			customModel: entry?.models?.[0]?.id ?? null,
+		});
+	}
+	// A managed provider the runtime failed to load (e.g. a hand-edited
+	// models.json) is still listed, so the app can delete or fix it.
+	const seen = new Set(out.map((o) => o.id));
+	for (const id of custom) {
+		if (seen.has(id)) continue;
+		const entry = config.providers[id];
+		if (!entry) continue;
+		out.push({
+			id,
+			name: entry.name ?? id,
+			configured: false,
+			oauth: false,
+			methods: [],
+			models: entry.models?.length ?? 0,
+			custom: true,
+			baseUrl: entry.baseUrl ?? null,
+			customModel: entry.models?.[0]?.id ?? null,
 		});
 	}
 	return out;
+}
+
+// ---------------------------------------------------------------------------
+// Custom providers: OpenAI-compatible endpoints added in
+// Settings → Models & providers. Definitions live in pi's models.json (the
+// format pi documents for compatible endpoints); a registry in the app state
+// dir remembers which provider ids the app manages, so built-in providers
+// and hand-written models.json overrides are never offered for deletion.
+
+const modelsJsonPath = join(agentDir, "models.json");
+const customProvidersPath = join(stateDir, "custom-providers.json");
+
+function readModelsJson(): { providers: Record<string, any> } {
+	try {
+		const parsed = JSON.parse(readFileSync(modelsJsonPath, "utf8"));
+		if (parsed && typeof parsed === "object" && parsed.providers && typeof parsed.providers === "object") {
+			return { providers: parsed.providers };
+		}
+	} catch {
+		// Missing or unreadable: start from an empty set.
+	}
+	return { providers: {} };
+}
+
+function writeModelsJson(config: { providers: Record<string, any> }) {
+	writeFileSync(modelsJsonPath, `${JSON.stringify(config, null, 2)}\n`);
+}
+
+function readCustomProviderIds(): string[] {
+	try {
+		const parsed = JSON.parse(readFileSync(customProvidersPath, "utf8"));
+		if (Array.isArray(parsed)) return parsed.filter((x): x is string => typeof x === "string");
+	} catch {
+		// None registered yet.
+	}
+	return [];
+}
+
+function writeCustomProviderIds(ids: string[]) {
+	mkdirSync(stateDir, { recursive: true });
+	writeFileSync(customProvidersPath, `${JSON.stringify(ids, null, 2)}\n`);
+}
+
+/** Reloads models.json for one provider after a save or delete. */
+async function refreshProvider(id: string) {
+	// Scoped, offline refresh: a full refresh re-fetches every provider's
+	// catalog over the network and can block this command for minutes.
+	await modelRuntime.refresh({ providers: [id], allowNetwork: false });
+}
+
+async function saveCustomProvider(cmd: Command) {
+	const name = String(cmd.name ?? "").trim();
+	const modelId = String(cmd.model ?? "").trim();
+	const apiKey = String(cmd.apiKey ?? "").trim();
+	const rawBaseUrl = String(cmd.baseUrl ?? "").trim();
+	const id = String(cmd.provider ?? "").trim().toLowerCase();
+	if (!name) throw new Error("Provider name is empty");
+	if (!/^[a-z0-9][a-z0-9_-]*$/.test(id)) {
+		throw new Error("Provider name must start with a letter or digit and use only letters, digits, - or _");
+	}
+	if (!modelId) throw new Error("Model ID is empty");
+	let url: URL;
+	try {
+		url = new URL(rawBaseUrl);
+	} catch {
+		throw new Error("Base URL is not a valid URL");
+	}
+	if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Base URL must start with http:// or https://");
+	const baseUrl = rawBaseUrl.replace(/\/+$/, "");
+
+	const registry = readCustomProviderIds();
+	const isOurs = registry.includes(id);
+	if (!isOurs && modelRuntime.getProviders().some((p) => p.id === id)) {
+		throw new Error(`"${id}" is already used by a built-in provider. Choose another name.`);
+	}
+	const config = readModelsJson();
+	const existing = config.providers[id];
+	// Editing without a new key keeps the stored one.
+	const key = apiKey || (typeof existing?.apiKey === "string" ? existing.apiKey : "");
+	if (!key) throw new Error("API key is empty");
+	config.providers[id] = {
+		name,
+		baseUrl,
+		api: "openai-completions",
+		apiKey: key,
+		models: [{ id: modelId }],
+	};
+	writeModelsJson(config);
+	if (!isOurs) writeCustomProviderIds([...registry, id]);
+	await refreshProvider(id);
+	return providers();
+}
+
+async function deleteCustomProvider(cmd: Command) {
+	const id = String(cmd.provider ?? "");
+	const registry = readCustomProviderIds();
+	if (!registry.includes(id)) throw new Error("That is not a custom provider");
+	const config = readModelsJson();
+	delete config.providers[id];
+	writeModelsJson(config);
+	writeCustomProviderIds(registry.filter((x) => x !== id));
+	await modelRuntime.logout(id).catch(() => {});
+	await refreshProvider(id);
+	return providers();
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +623,10 @@ async function handle(cmd: Command): Promise<unknown> {
 		case "logout":
 			await modelRuntime.logout(cmd.provider);
 			return providers();
+		case "custom_provider_save":
+			return saveCustomProvider(cmd);
+		case "custom_provider_delete":
+			return deleteCustomProvider(cmd);
 
 		case "new_session":
 			return openSession(SessionManager.create(cmd.cwd ?? workspace));
