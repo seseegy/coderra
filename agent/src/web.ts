@@ -1,11 +1,20 @@
 /**
- * web_search and web_fetch tools, so the agent can look up install steps,
- * docs and error messages instead of guessing.
+ * web_search, web_fetch and web_screenshot tools, so the agent can look up
+ * install steps, docs and error messages instead of guessing.
  *
  * Search works without a key (DuckDuckGo, DuckDuckGo Lite, then Brave, scraped
  * from their HTML pages). A Brave Search or Tavily key, when configured, is used first.
+ *
+ * Search1API keys (any number, configured in the app) take precedence over
+ * everything: search goes through its /search endpoint, fetch through /crawl,
+ * and web_screenshot renders through /screenshot. Keys rotate automatically —
+ * when one runs out of credits, hits a limit or fails, the next key is tried
+ * and the failing one cools down (see s1Call). If every key fails, search and
+ * fetch fall back to the keyless chain above.
  */
 
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { Type } from "typebox";
 
 const UA =
@@ -20,6 +29,103 @@ export interface SearchResult {
 export interface SearchKeys {
 	brave?: string;
 	tavily?: string;
+	/** Search1API keys in rotation order; empty/undefined when none are set. */
+	search1api?: string[];
+}
+
+// ---------------------------------------------------------------------------
+// Search1API (https://api.search1api.com) with automatic key rotation
+
+const S1_BASE = process.env.SEARCH1API_BASE_URL ?? "https://api.search1api.com";
+
+/** When a key may be tried again after a failure of the given kind. */
+function s1CooldownMs(status: number): number {
+	if (status === 401 || status === 403) return 24 * 3600_000; // invalid or forbidden key
+	if (status === 402 || status === 429) return 6 * 3600_000; // out of credits / rate limited
+	return 5 * 60_000; // 5xx and network errors: brief pause
+}
+
+const s1CoolUntil = new Map<string, number>();
+/** Index of the key that answered last; rotation resumes from there. */
+let s1Cursor = 0;
+
+class S1KeysExhausted extends Error {}
+
+interface S1Ok {
+	buf: ArrayBuffer;
+	contentType: string;
+	/** 0-based index of the key that answered. */
+	keyIndex: number;
+}
+
+/**
+ * POST to Search1API, rotating through `keys` until one answers. A key that
+ * fails with an auth, credit, limit or server error is put in cooldown and
+ * the next key is tried; a client error (bad request) is thrown at once,
+ * because rotating would not fix it. Key material is never put in messages —
+ * keys are referred to by position ("key #2") only.
+ */
+async function s1Call(path: string, body: unknown, keys: string[], signal?: AbortSignal): Promise<S1Ok> {
+	const now = Date.now();
+	const order: number[] = [];
+	for (let i = 0; i < keys.length; i++) order.push((s1Cursor + i) % keys.length);
+	const available = order.filter((i) => (s1CoolUntil.get(keys[i]) ?? 0) <= now);
+	if (available.length === 0) {
+		throw new S1KeysExhausted(
+			`Search1API: all ${keys.length} configured key(s) are cooling down after earlier failures`,
+		);
+	}
+	const failures: string[] = [];
+	for (const i of available) {
+		const key = keys[i];
+		let res: Response;
+		try {
+			res = await fetch(`${S1_BASE}${path}`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+				body: JSON.stringify(body),
+				signal,
+			});
+		} catch (e) {
+			if (signal?.aborted) throw e;
+			s1CoolUntil.set(key, Date.now() + s1CooldownMs(500));
+			failures.push(`key #${i + 1}: ${(e as Error).message}`);
+			continue;
+		}
+		if (res.ok) {
+			s1Cursor = i;
+			s1CoolUntil.delete(key);
+			return { buf: await res.arrayBuffer(), contentType: res.headers.get("content-type") ?? "", keyIndex: i };
+		}
+		if (res.status === 400 || res.status === 404 || res.status === 422) {
+			const detail = (await res.text().catch(() => "")).slice(0, 300);
+			throw new Error(`Search1API ${res.status}${detail ? `: ${detail}` : ""}`);
+		}
+		s1CoolUntil.set(key, Date.now() + s1CooldownMs(res.status));
+		failures.push(`key #${i + 1}: HTTP ${res.status}`);
+	}
+	throw new S1KeysExhausted(`Search1API: every key failed (${failures.join("; ")})`);
+}
+
+function s1Json(ok: S1Ok): any {
+	return JSON.parse(new TextDecoder().decode(ok.buf));
+}
+
+async function s1Search(q: string, n: number, keys: string[], signal?: AbortSignal): Promise<SearchResult[]> {
+	const body = s1Json(await s1Call("/search", { query: q, max_results: n, crawl_results: 0 }, keys, signal));
+	const out: SearchResult[] = (body.results ?? [])
+		.map((r: any) => ({ title: r.title ?? "", url: r.link ?? r.url ?? "", snippet: r.snippet ?? "" }))
+		.filter((r: SearchResult) => r.url);
+	if (out.length === 0) throw new Error("Search1API returned no results");
+	return out;
+}
+
+async function s1Crawl(url: string, keys: string[], signal?: AbortSignal) {
+	const body = s1Json(await s1Call("/crawl", { url }, keys, signal));
+	const r = body.results ?? {};
+	const content = typeof r.content === "string" ? r.content : "";
+	if (!content) throw new Error("Search1API crawl returned no content");
+	return { url: r.link ?? url, status: 200, contentType: "text/markdown", title: r.title ?? "", text: content };
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +233,7 @@ async function braveHtmlSearch(q: string, n: number, signal?: AbortSignal): Prom
 
 export async function webSearch(q: string, n: number, keys: SearchKeys, signal?: AbortSignal) {
 	const attempts: [string, () => Promise<SearchResult[]>][] = [];
+	if (keys.search1api?.length) attempts.push(["search1api", () => s1Search(q, n, keys.search1api!, signal)]);
 	if (keys.brave) attempts.push(["brave", () => braveSearch(q, n, keys.brave!, signal)]);
 	if (keys.tavily) attempts.push(["tavily", () => tavilySearch(q, n, keys.tavily!, signal)]);
 	attempts.push(
@@ -262,7 +369,19 @@ export function webTools(keys: () => SearchKeys) {
 				maxChars: Type.Optional(Type.Number({ description: "Characters to return (default 20000)" })),
 			}),
 			async execute(_id: string, params: { url: string; offset?: number; maxChars?: number }, signal?: AbortSignal) {
-				const page = await webFetch(params.url, signal);
+				const allKeys = keys();
+				const target = /^https?:\/\//i.test(params.url) ? params.url : `https://${params.url}`;
+				let page: Awaited<ReturnType<typeof webFetch>>;
+				if (allKeys.search1api?.length) {
+					try {
+						page = await s1Crawl(target, allKeys.search1api, signal);
+					} catch (e) {
+						if (signal?.aborted) throw e;
+						page = await webFetch(params.url, signal);
+					}
+				} else {
+					page = await webFetch(params.url, signal);
+				}
 				const offset = Math.max(params.offset ?? 0, 0);
 				const max = Math.min(Math.max(params.maxChars ?? 20000, 1000), 60000);
 				const chunk = page.text.slice(offset, offset + max);
@@ -275,6 +394,62 @@ export function webTools(keys: () => SearchKeys) {
 					.filter(Boolean)
 					.join("\n");
 				return text(`${head}\n\n${chunk}`);
+			},
+		},
+		{
+			name: "web_screenshot",
+			label: "Screenshot page",
+			description:
+				"Render a public web page with Search1API and return a screenshot image you can look at. Use it when layout or visual state matters. Requires a Search1API key (the user adds keys in the app under Network settings); keys rotate automatically when one runs out of credits. Costs 2 credits per screenshot.",
+			promptSnippet: "web_screenshot: render a web page and see it as an image",
+			parameters: Type.Object({
+				url: Type.String({ description: "The public URL to render" }),
+				fullPage: Type.Optional(Type.Boolean({ description: "Capture the whole page instead of the viewport (default false)" })),
+				format: Type.Optional(Type.String({ description: "png (default), jpeg or webp" })),
+			}),
+			async execute(
+				_id: string,
+				params: { url: string; fullPage?: boolean; format?: string },
+				signal?: AbortSignal,
+				_onUpdate?: unknown,
+				ctx?: { cwd?: string },
+			) {
+				const allKeys = keys();
+				if (!allKeys.search1api?.length) {
+					return text(
+						"web_screenshot needs a Search1API key, and none is configured. Ask the user to add one in the app: Network settings → Web search → Search1API.",
+					);
+				}
+				const format = ["png", "jpeg", "webp"].includes(params.format ?? "") ? params.format! : "png";
+				const target = /^https?:\/\//i.test(params.url) ? params.url : `https://${params.url}`;
+				const ok = await s1Call(
+					"/screenshot",
+					{ url: target, format, full_page: params.fullPage ?? false },
+					allKeys.search1api,
+					signal,
+				);
+				const mimeType = ok.contentType.startsWith("image/")
+					? ok.contentType.split(";")[0]
+					: `image/${format}`;
+				let saved = "";
+				if (ctx?.cwd) {
+					try {
+						const ext = format === "jpeg" ? "jpg" : format;
+						const path = join(ctx.cwd, `screenshot-${Date.now()}.${ext}`);
+						writeFileSync(path, Buffer.from(ok.buf));
+						saved = path;
+					} catch {}
+				}
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Screenshot of ${target} (Search1API key #${ok.keyIndex + 1})${saved ? `\nSaved to ${saved}` : ""}`,
+						},
+						{ type: "image" as const, data: Buffer.from(ok.buf).toString("base64"), mimeType },
+					],
+					details: undefined,
+				};
 			},
 		},
 	];

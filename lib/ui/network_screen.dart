@@ -173,6 +173,17 @@ class _NetworkScreenState extends State<NetworkScreen> {
                       onSave: (v) => _save({'tavilyKey': v}, done: v.isEmpty ? 'Key removed' : 'Tavily key saved'),
                       onLink: () => widget.agent.client.openUrl('https://app.tavily.com'),
                     ),
+                    const SizedBox(height: 10),
+                    _MultiKeyField(
+                      icon: LucideIcons.keyRound,
+                      color: const Color(0xFF14B8A6),
+                      title: 'Search1API',
+                      savedCount: s.search1apiKeyCount,
+                      onSave: (v) =>
+                          _save({'search1apiKeys': v}, done: v.isEmpty ? 'Search1API keys removed' : 'Search1API keys saved'),
+                      onAppend: (v) => _save({'search1apiKeysAppend': v}, done: 'Search1API keys added'),
+                      onLink: () => widget.agent.client.openUrl('https://s1.dev'),
+                    ),
                   ],
                 ),
         );
@@ -304,6 +315,107 @@ class _KeyFieldState extends State<_KeyField> {
               ],
             ),
           ],
+        ],
+      ),
+    );
+  }
+}
+
+/// Paste-any-number-of-keys field for Search1API. Keys are write-only: the
+/// card shows how many are stored, new pastes are appended on the host, and
+/// the trash button clears them all. The web tools rotate through the keys
+/// automatically, so a key that runs out of credits is skipped for the next.
+class _MultiKeyField extends StatefulWidget {
+  const _MultiKeyField({
+    required this.icon,
+    required this.color,
+    required this.title,
+    required this.savedCount,
+    required this.onSave,
+    required this.onAppend,
+    required this.onLink,
+  });
+  final IconData icon;
+  final Color color;
+  final String title;
+  final int savedCount;
+  final Future<void> Function(String value) onSave;
+  final Future<void> Function(String value) onAppend;
+  final VoidCallback onLink;
+
+  @override
+  State<_MultiKeyField> createState() => _MultiKeyFieldState();
+}
+
+class _MultiKeyFieldState extends State<_MultiKeyField> {
+  final keys = TextEditingController();
+
+  @override
+  void dispose() {
+    keys.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final p = context.palette;
+    final text = Theme.of(context).textTheme;
+    final hasKeys = widget.savedCount > 0;
+    return SurfaceCard(
+      padding: const EdgeInsets.fromLTRB(14, 12, 10, 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              IconTile(icon: widget.icon, color: widget.color, size: 32),
+              const SizedBox(width: 12),
+              Expanded(child: Text(widget.title, style: text.titleSmall)),
+              if (hasKeys) ...[
+                Pill('${widget.savedCount} keys', color: p.success, dot: true),
+                IconButton(
+                  tooltip: 'Remove all keys',
+                  icon: const Icon(LucideIcons.trash2, size: 16),
+                  onPressed: () => widget.onSave(''),
+                ),
+              ] else
+                IconButton(
+                  tooltip: 'Get keys',
+                  icon: const Icon(LucideIcons.externalLink, size: 16),
+                  onPressed: widget.onLink,
+                ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'Powers web_search, web_fetch and web_screenshot. Paste as many keys as you like, one per line — when a key runs out of credits or errors, the agent rotates to the next one automatically.',
+            style: text.bodySmall,
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: keys,
+            autocorrect: false,
+            enableSuggestions: false,
+            maxLines: 4,
+            style: const TextStyle(fontFamily: mono, fontSize: 13),
+            decoration: InputDecoration(hintText: hasKeys ? 'Paste more keys, one per line' : 'Paste API keys, one per line'),
+          ),
+          const SizedBox(height: 8),
+          Align(
+            alignment: Alignment.centerRight,
+            child: FilledButton(
+              onPressed: () async {
+                if (keys.text.trim().isEmpty) return;
+                if (hasKeys) {
+                  await widget.onAppend(keys.text);
+                } else {
+                  await widget.onSave(keys.text);
+                }
+                keys.clear();
+              },
+              child: Text(hasKeys ? 'Add keys' : 'Save keys'),
+            ),
+          ),
         ],
       ),
     );
