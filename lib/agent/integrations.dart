@@ -111,6 +111,7 @@ class AppSettings {
   String? get dnsUrl => json['dnsUrl'] as String?;
   bool get hasBraveKey => json['braveKey'] == true;
   bool get hasTavilyKey => json['tavilyKey'] == true;
+  int get search1apiKeyCount => (json['search1apiKeys'] as num?)?.toInt() ?? 0;
   String get approvalMode => json['approvalMode'] as String? ?? 'ask_risky';
   List<Map<String, dynamic>> get fallbackModels =>
       (json['fallbackModels'] as List? ?? const []).map((e) => (e as Map).cast<String, dynamic>()).toList();

@@ -53,7 +53,7 @@ import {
 type Command = { id?: number; type: string; [key: string]: any };
 
 /** Built-in and app tools; MCP tools are added per session. This is the *active* set. */
-const TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "web_search", "web_fetch"];
+const TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "web_search", "web_fetch", "web_screenshot"];
 
 const agentDir = getAgentDir();
 const workspace = process.env.ANDROPI_WORKSPACE ?? process.cwd();
@@ -290,7 +290,7 @@ You are running inside AndroPI, an Android app, on the user's phone.
   use \`apt-get install -y\` (Debian) or \`apk add\` (Alpine) to get Python,
   Node.js, compilers and anything else. The home folder and workspace are the
   same paths inside and out.
-- You have \`web_search\` and \`web_fetch\` tools. Use them before guessing how
+- You have \`web_search\`, \`web_fetch\` and \`web_screenshot\` tools. Use them before guessing how
   to install or use something, and to look up unfamiliar errors.
 - Dev servers: run them in the background (\`nohup npm run dev > dev.log 2>&1 &\`)
   and print the URL (e.g. http://localhost:5173); the app offers a live

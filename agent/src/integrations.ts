@@ -35,6 +35,10 @@ export interface AppSettings {
 	dnsUrl?: string;
 	braveKey?: string;
 	tavilyKey?: string;
+	/** Search1API keys, stored as pasted (usually one per line). No count
+	 * limit: the web tools rotate to the next key when one runs out of
+	 * credits, hits a limit or errors (see web.ts). */
+	search1apiKeys?: string;
 	/** Agent shell in the Linux container; unset means on whenever it is installed. */
 	containerShell?: boolean;
 	/** When the agent must ask before acting (see guard.ts). */
@@ -46,6 +50,21 @@ export interface AppSettings {
 }
 
 const DEFAULT_SETTINGS: AppSettings = { dns: "cloudflare" };
+
+/** Split a pasted blob of Search1API keys (lines, commas, semicolons or
+ * spaces) into a deduped list, preserving order. */
+export function parseSearch1apiKeys(blob?: string): string[] {
+	if (!blob) return [];
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const part of blob.split(/[\s,;]+/)) {
+		const key = part.trim();
+		if (key.length < 8 || seen.has(key)) continue;
+		seen.add(key);
+		out.push(key);
+	}
+	return out;
+}
 
 /** Client ID of the AndroPI GitHub OAuth App (device flow enabled). Public by design; no secret is used. */
 const GITHUB_CLIENT_ID = process.env.ANDROPI_GITHUB_CLIENT_ID ?? "Ov23lidVAetnaasSTbSU";
@@ -99,23 +118,37 @@ export class Integrations {
 
 	/** Keys are write-only from the app's point of view: it only learns whether one is set. */
 	publicSettings() {
-		const { dns, dnsUrl, braveKey, tavilyKey, approvalMode, fallbackModels, dailyBudget } = this.settings;
+		const { dns, dnsUrl, braveKey, tavilyKey, search1apiKeys, approvalMode, fallbackModels, dailyBudget } = this.settings;
 		return {
 			dns,
 			dnsUrl: dnsUrl ?? null,
 			braveKey: !!braveKey,
 			tavilyKey: !!tavilyKey,
+			// Keys stay write-only; the app only learns how many are stored.
+			search1apiKeys: parseSearch1apiKeys(search1apiKeys).length,
 			approvalMode: approvalMode ?? "ask_risky",
 			fallbackModels: fallbackModels ?? [],
 			dailyBudget: dailyBudget ?? 0,
 		};
 	}
 
-	updateSettings(patch: Partial<AppSettings>) {
+	updateSettings(patch: Partial<AppSettings> & { search1apiKeysAppend?: string }) {
 		const next: AppSettings = { ...this.settings };
-		for (const [k, v] of Object.entries(patch)) {
+		// Appending keys must not require the app to read the stored ones
+		// back, so it is a separate pseudo-field merged in here.
+		const append = patch.search1apiKeysAppend;
+		const rest: Record<string, unknown> = { ...patch };
+		delete rest.search1apiKeysAppend;
+		for (const [k, v] of Object.entries(rest)) {
 			if (v === undefined) continue;
 			(next as any)[k] = v === "" || v === null ? undefined : v;
+		}
+		if (append) {
+			const merged = parseSearch1apiKeys(next.search1apiKeys);
+			for (const key of parseSearch1apiKeys(append)) {
+				if (!merged.includes(key)) merged.push(key);
+			}
+			next.search1apiKeys = merged.length ? merged.join("\n") : undefined;
 		}
 		this.store.settings = next;
 		this.save();
@@ -129,7 +162,11 @@ export class Integrations {
 	}
 
 	searchKeys() {
-		return { brave: this.settings.braveKey, tavily: this.settings.tavilyKey };
+		return {
+			brave: this.settings.braveKey,
+			tavily: this.settings.tavilyKey,
+			search1api: parseSearch1apiKeys(this.settings.search1apiKeys),
+		};
 	}
 
 	private save() {
