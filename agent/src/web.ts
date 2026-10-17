@@ -13,7 +13,7 @@
  * fetch fall back to the keyless chain above.
  */
 
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Type } from "typebox";
 
@@ -435,7 +435,9 @@ export function webTools(keys: () => SearchKeys) {
 				if (ctx?.cwd) {
 					try {
 						const ext = format === "jpeg" ? "jpg" : format;
-						const path = join(ctx.cwd, `screenshot-${Date.now()}.${ext}`);
+						const dir = join(ctx.cwd, "screenshots");
+						mkdirSync(dir, { recursive: true });
+						const path = join(dir, `screenshot-${Date.now()}.${ext}`);
 						writeFileSync(path, Buffer.from(ok.buf));
 						saved = path;
 					} catch {}
