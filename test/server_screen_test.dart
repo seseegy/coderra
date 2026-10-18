@@ -30,7 +30,7 @@ class StubSetup extends RemoteSetup {
   var installs = 0;
 
   @override
-  Future<String> ensureKey() async => pubKey;
+  Future<String> ensureKey({Map<String, String>? env}) async => pubKey;
 
   @override
   Future<ServerCheck> check(RemoteProfile p, {Map<String, String>? env, Duration timeout = const Duration(seconds: 30)}) async {
