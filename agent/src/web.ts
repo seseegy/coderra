@@ -309,12 +309,12 @@ export function htmlToText(html: string, base = ""): string {
 	if (main && main[0].length > 500) s = main[0];
 	s = s.replace(/<(script|style|noscript|svg|head|template|iframe|nav|footer|form)\b[\s\S]*?<\/\1>/gi, "");
 	s = s.replace(/<!--[\s\S]*?-->/g, "");
-	s = s.replace(/<pre\b[^>]*>([\s\S]*?)<\/pre>/gi, (_, code) => `\n\n\`\`\`\n${decodeEntities(stripTags(code))}\n\`\`\`\n\n`);
-	s = s.replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, (_, code) => `\`${decodeEntities(stripTags(code))}\``);
-	s = s.replace(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi, (_, n, t) => `\n\n${"#".repeat(Number(n))} ${stripTags(t).trim()}\n\n`);
+	s = s.replace(/<pre\b[^>]*>([\s\S]*?)<\/pre>/gi, (_, code) => `\n\n\`\`\`\n${stripTagsRaw(code)}\n\`\`\`\n\n`);
+	s = s.replace(/<code\b[^>]*>([\s\S]*?)<\/code>/gi, (_, code) => `\`${stripTagsRaw(code)}\``);
+	s = s.replace(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi, (_, n, t) => `\n\n${"#".repeat(Number(n))} ${stripTagsRaw(t)}\n\n`);
 	s = s.replace(/<a\b[^>]*href="([^"#][^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, (_, href, t) => {
-		const label = stripTags(t).trim();
-		if (!label) return "";
+		const label = stripTagsRaw(t);
+		if (!decodeEntities(label).trim()) return "";
 		let abs = decodeEntities(href);
 		try {
 			abs = new URL(abs, base).href;
@@ -334,8 +334,17 @@ export function htmlToText(html: string, base = ""): string {
 		.trim();
 }
 
+/** A real tag starts with a letter, "/" or "!". A bare "<" in text ("a < b") is not one. */
+const TAG = /<\/?[A-Za-z!][^>]*>/g;
+
+/** Tags removed and whitespace tidied, entities left encoded. Used for text that is embedded in the page before the
+ * final pass: decoding it early would turn "&lt;" into a "<" that the final tag-stripping then eats. */
+function stripTagsRaw(s: string) {
+	return s.replace(TAG, "").replace(/\s+\n/g, "\n").trim();
+}
+
 function stripTags(s: string) {
-	return decodeEntities(s.replace(/<[^>]+>/g, "")).replace(/\s+\n/g, "\n").trim();
+	return decodeEntities(s.replace(TAG, "")).replace(/\s+\n/g, "\n").trim();
 }
 
 function decodeEntities(s: string) {

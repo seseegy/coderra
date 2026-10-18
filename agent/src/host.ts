@@ -10,9 +10,14 @@
  *   host -> app    {"type": "auth_prompt" | "approval" | "task" | "runs" | ...}
  *
  * stdout is reserved for protocol records; logs go to stderr.
+ *
+ * With `--listen <socket path>` (or ANDROPI_LISTEN) the host instead runs as a daemon that outlives its clients:
+ * it serves the same protocol on a unix socket, keeps recent records so a client that dropped can `resume`, and
+ * stays up when the client disconnects. See transport.ts.
  */
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -26,7 +31,9 @@ import {
 	SettingsManager,
 	VERSION,
 } from "@earendil-works/pi-coding-agent";
+import { AGENTS_MARKER, agentsFileText, LEGACY_STARTS } from "./agents-file.js";
 import { Checkpoints } from "./checkpoints.js";
+import { Fs, isFsCommand, runFsCommand } from "./fs.js";
 import { Container, type Distro } from "./container.js";
 import { installDohLookup } from "./dns.js";
 import { appUpdateDownloadStatus, checkAppUpdate, startAppUpdateDownload } from "./update.js";
@@ -37,25 +44,32 @@ import { installLenientTools } from "./lenient.js";
 import { Mcp } from "./mcp.js";
 import { patchedTools } from "./patched-tools.js";
 import { type RunSession, Runner } from "./runs.js";
+import { Hub, LineBuffer, listenOnSocket, PROTOCOL, RestartGate, stdioConn } from "./transport.js";
+import { DEFAULT_HEALTH_LIMITS, Health, type HealthChange, humanBytes } from "./health.js";
+import { CONTINUE_CHAT, endsUnfinished } from "./interrupted.js";
+import { Notifier } from "./notify.js";
+import { createBackup, estimateBackup, restoreBackup } from "./backup.js";
+import { PodmanBox } from "./podmanbox.js";
+import { Preview } from "./preview.js";
+import { backoffFromEnv, cancellableSleep, promptWithRetry } from "./retry.js";
+import { type ChildSession, EXPLORER_TOOLS, type Role, Slots, type SubagentDeps, subagentTool } from "./subagent.js";
 import { Skills } from "./skills.js";
+import { latestChecklist, record as tasksRecord, tasksTool } from "./tasks.js";
 import { webTools } from "./web.js";
 import {
-	collectFiles,
 	dbQuery,
 	dbTables,
 	detectTests,
-	readZip,
 	search,
 	Templates,
 	Tunnels,
 	usageSummary,
-	writeZip,
 } from "./workbench.js";
 
 type Command = { id?: number; type: string; [key: string]: any };
 
 /** Built-in and app tools; MCP tools are added per session. This is the *active* set. */
-const TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "web_search", "web_fetch", "web_screenshot"];
+const TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "web_search", "web_fetch", "web_screenshot", "tasks", "subagent"];
 
 const agentDir = getAgentDir();
 const workspace = process.env.ANDROPI_WORKSPACE ?? process.cwd();
@@ -69,13 +83,18 @@ let container: Container;
 let skills: Skills;
 let templates: Templates;
 let checkpoints: Checkpoints;
+let fsService: Fs;
+let preview: Preview;
 let runner: Runner;
 let mcp: Mcp;
 const tunnels = new Tunnels();
 let unsubscribe: (() => void) | undefined;
 
 const guard = new Guard({
-	send: (r) => send(r),
+	send: (r) => {
+		send(r);
+		if ((r as { type?: string }).type === "approval") void notifier.send("approval", "Approval needed", { priority: 4, tags: ["raised_hand"] });
+	},
 	checkpoint: async (cwd, label) => {
 		await checkpoints.snapshot(cwd, label);
 	},
@@ -85,8 +104,98 @@ const guard = new Guard({
 // ---------------------------------------------------------------------------
 // Output
 
+function argValue(name: string): string | undefined {
+	const i = process.argv.indexOf(name);
+	return i >= 0 ? process.argv[i + 1] : undefined;
+}
+
+/** Set when running as a daemon on a unix socket; unset when the app spawned this process and talks over stdio. */
+const listenPath = argValue("--listen") ?? process.env.ANDROPI_LISTEN;
+
+/** "vps" on a server, "local" on the phone. The daemon is a server unless told otherwise. */
+const mode = process.env.ANDROPI_MODE ?? (listenPath ? "vps" : "local");
+
+/** The launcher that runs bash inside the rootless container on a server (server/box/box). */
+const boxScript = process.env.CODERRA_BOX ?? join(process.env.HOME ?? "", ".coderra", "bin", "box");
+
+const hub = new Hub({
+	replay: !!listenPath,
+	mode,
+	hostVersion: VERSION,
+	handle: (cmd) => handle(cmd as Command),
+	// Only tests shorten these.
+	pingIntervalMs: Number(process.env.CODERRA_PING_MS) || undefined,
+	idleTimeoutMs: Number(process.env.CODERRA_IDLE_MS) || undefined,
+});
+// The app that spawned us is connected from the first byte, so early records (startup notices) reach it.
+const stdio = listenPath ? undefined : hub.attach(stdioConn());
+
 function send(record: object) {
-	process.stdout.write(`${JSON.stringify(record)}\n`);
+	hub.emit(record);
+}
+
+/** Where the host keeps its own small files on a server (the box script uses the same variable). */
+const coderraDir = process.env.CODERRA_DIR ?? join(process.env.HOME ?? agentDir, ".coderra");
+/** Exists while the daemon runs and is removed by a clean shutdown; finding it at start means the last run did not end cleanly. */
+const runningMarker = join(coderraDir, "running");
+
+/** The rootless container the agent's shell runs in on a server (server/box). */
+const box = new PodmanBox({ script: boxScript, coderraDir });
+
+const envBytes = (name: string) => {
+	const n = Number(process.env[name]);
+	return Number.isFinite(n) && n > 0 ? n : undefined;
+};
+
+/** Disk and memory. On a server a nearly full disk refuses new work; on a phone it is only reported. */
+const health = new Health({
+	path: workspace,
+	enforce: mode === "vps",
+	limits: {
+		diskWarnBytes: envBytes("CODERRA_DISK_WARN_BYTES") ?? DEFAULT_HEALTH_LIMITS.diskWarnBytes,
+		diskMinBytes: envBytes("CODERRA_DISK_MIN_BYTES") ?? DEFAULT_HEALTH_LIMITS.diskMinBytes,
+		memoryWarnBytes: envBytes("CODERRA_MEMORY_WARN_BYTES") ?? DEFAULT_HEALTH_LIMITS.memoryWarnBytes,
+	},
+	onChange: reportHealth,
+});
+
+/** Pushes to the phone when nobody is looking at the app (notify.ts). */
+const notifier = new Notifier({
+	config: () => integrations?.notifyConfig() ?? null,
+	shouldSend: () => !hub.hasClient() || hub.clientInBackground(),
+	log: (m) => log(m),
+});
+
+function reportHealth(c: HealthChange) {
+	if (c.what === "disk") {
+		if (c.to === "ok") {
+			send({ type: "notice", message: `Disk space is back to normal (${humanBytes(c.freeBytes)} free).` });
+			return;
+		}
+		const critical = c.to === "critical";
+		send({
+			type: "notice",
+			message: critical
+				? `The disk is almost full (${humanBytes(c.freeBytes)} free). New prompts and tasks are refused until space is freed.`
+				: `Disk space is getting low (${humanBytes(c.freeBytes)} free).`,
+		});
+		void notifier.send("disk", critical ? "Disk is almost full" : "Disk space is low", { priority: critical ? 5 : 4, tags: ["warning"] });
+	} else if (c.to === "high") {
+		send({ type: "notice", message: `The host is using a lot of memory (${humanBytes(c.rssBytes)}).` });
+		void notifier.send("memory", "Host memory is high", { priority: 3, tags: ["warning"] });
+	}
+}
+
+/** A background run ended: tell the phone, unless the user stopped it themselves. */
+function notifyRunFinished(run: { status: string }) {
+	const titles: Record<string, [string, 1 | 2 | 3 | 4 | 5, string]> = {
+		done: ["Task finished", 3, "white_check_mark"],
+		error: ["Task failed", 4, "x"],
+		blocked: ["Task needs you", 4, "raised_hand"],
+		limit: ["Task hit its limit", 4, "hourglass"],
+	};
+	const t = titles[run.status];
+	if (t) void notifier.send(`run_${run.status}`, t[0], { priority: t[1], tags: [t[2]] });
 }
 
 function log(...args: unknown[]) {
@@ -135,21 +244,39 @@ function state() {
 		billingNotice: billingNotice(),
 		planMode: guard.planMode,
 		approvalMode: guard.mode,
+		// The chat stops in the middle of something and nothing is running: the host was cut off while it worked.
+		interrupted: !s.isStreaming && endsUnfinished(s.sessionManager.getLeafEntry()),
 	};
 }
 
+/** The guard for runs nobody is watching: risky commands and writes outside the project are refused, not asked about. */
+function unattendedGuard(cwd: string): Guard {
+	const g = new Guard({
+		send: () => {},
+		checkpoint: async (dir, label) => {
+			await checkpoints.snapshot(dir, label);
+		},
+		cwd: () => cwd,
+	});
+	g.mode = "deny_risky";
+	return g;
+}
+
 /** Every session (chat or background run) is built the same way. */
-async function buildSession(sessionManager: SessionManager, opts: { interactive: boolean }) {
+async function buildSession(sessionManager: SessionManager, opts: { interactive: boolean; tools?: string[]; child?: boolean; mcp?: boolean }) {
 	const cwd = sessionManager.getCwd();
 	const resourceLoader = new DefaultResourceLoader({
 		cwd,
 		agentDir,
 		settingsManager,
 		// Approvals and plan mode only make sense with someone watching.
-		extensionFactories: opts.interactive ? [{ name: "andropi", factory: guard.extension, hidden: true }] : [],
+		// A person watching can approve things (and use plan mode). A background run cannot, so it gets a guard that
+		// refuses what would have needed approval.
+		extensionFactories: [{ name: "andropi", factory: opts.interactive ? guard.extension : unattendedGuard(cwd).extension, hidden: true }],
 	});
 	await resourceLoader.reload();
-	const mcpTools = mcp.toolDefinitions();
+	// A sub-agent gets only what its role allows: no MCP servers unless it is a worker, and never `tasks` or `subagent`.
+	const mcpTools = opts.mcp === false ? [] : mcp.toolDefinitions();
 	const result = await createAgentSession({
 		cwd,
 		agentDir,
@@ -157,10 +284,11 @@ async function buildSession(sessionManager: SessionManager, opts: { interactive:
 		settingsManager,
 		sessionManager,
 		resourceLoader,
-		tools: [...TOOLS, ...mcpTools.map((t) => t.name)],
+		tools: [...(opts.tools ?? TOOLS), ...mcpTools.map((t) => t.name)],
 		customTools: [
 			...patchedTools(cwd, { autoResizeImages: settingsManager.getImageAutoResize() }),
 			...webTools(() => integrations.searchKeys()),
+			...(opts.child ? [] : [tasksTool((r) => send(r)), subagentTool(subagentDeps)]),
 			...mcpTools,
 		] as any,
 	});
@@ -195,6 +323,7 @@ function onSessionEvent(event: AgentSessionEvent) {
 	if (event.type === "agent_end" || (event as any).type === "agent_settled") {
 		const text = session?.getLastAssistantText?.() ?? "";
 		send({ type: "agent_done", sessionFile: session?.sessionFile ?? null, preview: text.slice(0, 200) });
+		void notifier.send("agent_done", "Agent finished", { tags: ["white_check_mark"] });
 	}
 }
 
@@ -240,75 +369,148 @@ async function reopenSession() {
 }
 
 /** A headless session for the background runner. */
-async function backgroundSession(cwd: string): Promise<RunSession> {
-	const { session: bg } = await buildSession(SessionManager.create(cwd || workspace), { interactive: false });
+/** Sub-agents: at most two at a time (they share this process's memory), and what they cost counts toward the parent's job. */
+const childCost = new Map<string, number>();
+const subagentDeps: SubagentDeps = {
+	slots: new Slots(Number(process.env.CODERRA_SUBAGENTS_MAX) || 2),
+	preflight: async () => {
+		await health.assertRoom();
+		checkBudget();
+	},
+	recordCost: (parent, cost) => void childCost.set(parent, (childCost.get(parent) ?? 0) + cost),
+	create: (o) => createChild(o),
+};
+
+/** A session for a sub-agent: its own conversation (named after the job, so it can be found), tools by role, nobody to ask. */
+async function createChild(o: { role: Role; cwd: string; model?: string; parentModel?: string; title: string }): Promise<ChildSession> {
+	const find = (name: string) => {
+		const at = name.indexOf("/");
+		return at > 0 ? modelRuntime.getModel(name.slice(0, at), name.slice(at + 1)) : undefined;
+	};
+	const model = o.model ? find(o.model) : o.parentModel ? find(o.parentModel) : undefined;
+	if (o.model && !model) throw new Error(`Unknown model "${o.model}". Write it as provider/model.`);
+
+	const manager = SessionManager.create(o.cwd);
+	manager.appendSessionInfo(`↳ ${o.title}`);
+	const tools = o.role === "explorer" ? EXPLORER_TOOLS : TOOLS.filter((t) => t !== "subagent" && t !== "tasks");
+	const { session: cs } = await buildSession(manager, { interactive: false, tools, child: true, mcp: o.role === "worker" });
+	try {
+		if (model) await cs.setModel(model, { persist: false });
+	} catch (e) {
+		cs.dispose();
+		throw e;
+	}
 	let error: string | undefined;
+	let onTool: ((name: string, args: Record<string, unknown>) => void) | undefined;
+	cs.subscribe((e) => {
+		const m = (e as any).message;
+		if (e.type === "tool_execution_start") onTool?.(e.toolName, (e.args ?? {}) as Record<string, unknown>);
+		if (e.type === "message_end" && m?.role === "assistant") error = m.stopReason === "error" ? String(m.errorMessage ?? "error") : undefined;
+	});
+	return {
+		sessionFile: cs.sessionFile,
+		prompt: (text) => cs.prompt(text),
+		lastText: () => cs.getLastAssistantText() ?? "",
+		errorText: () => error,
+		abort: () => cs.abort(),
+		dispose: () => cs.dispose(),
+		cost: () => cs.getSessionStats().cost,
+		onTool: (cb) => void (onTool = cb),
+	};
+}
+
+async function backgroundSession(cwd: string, sessionFile?: string): Promise<RunSession> {
+	// A run picked up again after a restart reopens its own conversation instead of starting a new one.
+	const manager = sessionFile ? SessionManager.open(sessionFile) : SessionManager.create(cwd || workspace);
+	const { session: bg } = await buildSession(manager, { interactive: false });
+	const where = manager.getCwd();
+	let error: string | undefined;
+	let aborted = false;
+	const napping = cancellableSleep();
 	bg.subscribe((e) => {
 		const m = (e as any).message;
-		if (e.type === "message_end" && m?.role === "assistant" && m.stopReason === "error") error = m.errorMessage;
+		// The last answer decides: pi's own retry may have recovered from an earlier failure.
+		if (e.type === "message_end" && m?.role === "assistant") error = m.stopReason === "error" ? m.errorMessage : undefined;
 	});
+
+	/** After a temporary failure, move on to the next configured fallback model, if there is one. */
+	let fallbackStep = 0;
+	const switchModel = async () => {
+		const chain = integrations.settings.fallbackModels ?? [];
+		if (!chain.length) return;
+		const current = `${bg.model?.provider}/${bg.model?.id}`;
+		const candidates = chain.filter((f) => `${f.provider}/${f.model}` !== current);
+		const next = candidates[fallbackStep++ % Math.max(candidates.length, 1)];
+		const model = next && modelRuntime.getModel(next.provider, next.model);
+		if (model) await bg.setModel(model, { persist: false }).catch(() => {});
+	};
+
 	return {
 		sessionFile: bg.sessionFile,
 		prompt: async (text) => {
 			checkBudget();
-			await bg.prompt(text);
+			await health.assertRoom();
+			await promptWithRetry(text, {
+				prompt: (t) => bg.prompt(t),
+				error: () => error,
+				clearError: () => void (error = undefined),
+				backoffMs: backoffFromEnv(process.env.CODERRA_RETRY_BACKOFF_MS),
+				maxRetries: Number(process.env.CODERRA_RETRY_MAX) || 12,
+				isAborted: () => aborted,
+				sleep: napping.sleep,
+				onRetry: async ({ attempt, waitMs, error: why }) => {
+					log(`background run: temporary error, waiting ${Math.round(waitMs / 1000)}s before attempt ${attempt + 1}: ${why.slice(0, 120)}`);
+					await switchModel();
+				},
+			});
 		},
 		lastText: () => bg.getLastAssistantText(),
 		errorText: () => error,
-		abort: () => bg.abort(),
+		abort: async () => {
+			aborted = true;
+			napping.cancel();
+			await bg.abort();
+		},
 		dispose: () => bg.dispose(),
+		cost: () => bg.getSessionStats().cost + (childCost.get(bg.sessionManager.getSessionId()) ?? 0),
+		checklist: () => latestChecklist(bg.sessionManager.getBranch()),
+		runCommand: (command) => runShell(command, where),
+		snapshot: async (label) => (await checkpoints.snapshot(where, label)) !== null,
 	};
 }
 
-const AGENTS_MARKER = "<!-- andropi:managed (delete this line to keep your own edits) -->";
+/** Runs a shell command the way the agent's own shell would (inside the container on a server), and returns how it ended. */
+function runShell(command: string, cwd: string): Promise<{ code: number; output: string }> {
+	return new Promise((resolve) => {
+		const shell = settingsManager.getShellPath() ?? (existsSync("/bin/bash") ? "/bin/bash" : existsSync("/system/bin/sh") ? "/system/bin/sh" : "/bin/sh");
+		const child = spawn(shell, ["-c", command], { cwd, env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+		let output = "";
+		const keep = (chunk: Buffer) => {
+			output = (output + chunk.toString("utf8")).slice(-20_000);
+		};
+		child.stdout.on("data", keep);
+		child.stderr.on("data", keep);
+		const timer = setTimeout(() => child.kill("SIGKILL"), 15 * 60_000);
+		child.on("error", (e) => {
+			clearTimeout(timer);
+			resolve({ code: 127, output: String(e.message) });
+		});
+		child.on("close", (code) => {
+			clearTimeout(timer);
+			resolve({ code: code ?? 1, output });
+		});
+	});
+}
 
 /** Keeps the environment notes current, unless the user has taken the file over. */
 function ensureAgentsFile() {
 	const path = join(agentDir, "AGENTS.md");
 	if (existsSync(path)) {
 		const current = readFileSync(path, "utf8");
-		const ours = current.includes(AGENTS_MARKER) || current.startsWith("# Environment\n\nYou are running inside AndroPI") || current.startsWith("# Environment\n\nYou are running inside CoderRa");
+		const ours = current.includes(AGENTS_MARKER) || LEGACY_STARTS.some((start) => current.startsWith(start));
 		if (!ours) return;
 	}
-	writeFileSync(
-		path,
-		`${AGENTS_MARKER}
-# Environment
-
-You are running inside CoderRa, an Android app, on the user's phone.
-
-- The shell is Android's /system/bin/sh (mksh) with toybox utilities, not bash.
-  Prefer POSIX sh syntax. There is no sudo, apt or pkg.
-- Every bash call starts in the workspace directory; \`cd\` does not persist
-  between calls. A grep exit code of 1 means "no matches", not an error.
-- On PATH: \`node\`, \`git\`, \`ssh\`, \`ssh-keygen\`, \`scp\`, \`rsync\`, \`curl\`, \`rg\`, \`fd\`.
-  With scp, pass \`-S ssh\`.
-- The workspace directory is ${workspace}. Projects live in subfolders of it.
-  Keep files inside it unless asked otherwise.
-- When the user has connected accounts in the app:
-  - GitHub: \`$GITHUB_TOKEN\` is set and git is already authenticated for
-    https://github.com (clone, pull, push work directly). Use the REST API
-    with curl for everything else (issues, PRs, repos).
-  - Vercel: \`$VERCEL_TOKEN\` is set for the Vercel REST API.
-  - SSH: saved servers are aliases in ~/.ssh/config, so \`ssh <name>\` works.
-    The device key is ~/.ssh/id_ed25519.
-- Linux container: when the user has installed one (Debian or Alpine, via
-  proot), \`box -c '<command>'\` runs a command inside it, and \`box\` alone opens
-  a shell. When it is enabled as your shell, every command already runs inside:
-  use \`apt-get install -y\` (Debian) or \`apk add\` (Alpine) to get Python,
-  Node.js, compilers and anything else. The home folder and workspace are the
-  same paths inside and out.
-- You have \`web_search\`, \`web_fetch\` and \`web_screenshot\` tools. Use them before guessing how
-  to install or use something, and to look up unfamiliar errors.
-- Dev servers: run them in the background (\`nohup npm run dev > dev.log 2>&1 &\`)
-  and print the URL (e.g. http://localhost:5173); the app offers a live
-  preview and a public link for any localhost port it sees.
-- Some actions need the user's approval in the app; if one is declined, ask
-  what they want instead rather than retrying.
-- There is no display server; do not try to open GUIs or browsers. The app can
-  preview HTML files you write.
-`,
-	);
+	writeFileSync(path, agentsFileText({ mode, workspace, box: mode === "vps" && existsSync(boxScript) && integrations?.settings?.containerShell !== false }));
 }
 
 // ---------------------------------------------------------------------------
@@ -686,57 +888,55 @@ function backupTarget() {
 	}
 }
 
-function createBackup(includeWorkspace: boolean) {
-	// Secrets (provider keys, tokens) are left out on purpose.
-	const entries = [
-		...collectFiles(join(agentDir, "sessions"), agentDir),
-		...collectFiles(join(agentDir, "skills"), agentDir),
-		...collectFiles(join(agentDir, "prompts"), agentDir),
-		...["settings.json", "AGENTS.md", "andropi/runs.json"]
-			.filter((f) => existsSync(join(agentDir, f)))
-			.map((f) => ({ name: f, data: readFileSync(join(agentDir, f)) })),
-	].map((e) => ({ name: `agent/${e.name}`, data: e.data }));
-	if (includeWorkspace) {
-		for (const e of collectFiles(workspace, workspace, new Set(["node_modules", ".git", "backups", ".venv", "venv"]))) {
-			entries.push({ name: `workspace/${e.name}`, data: e.data });
-		}
-	}
-	const path = backupTarget();
-	writeFileSync(path, writeZip(entries));
-	return { path, files: entries.length };
+/** Changing the box kills whatever is running in it. Refuse while the agent is, unless the app says it is meant. */
+async function guardBoxWork(cmd: Command) {
+	if (mode !== "vps") throw new Error("Only a server has a box");
+	if (cmd.force === true) return;
+	const working = session?.isStreaming ? "The agent is working in the box right now." : runner?.summary().running ? "A background task is running in the box." : null;
+	if (working) throw Object.assign(new Error(`${working} Stop it first, or do it anyway.`), { code: "busy" });
 }
 
-function restoreBackup(path: string) {
-	const entries = readZip(readFileSync(path));
-	let restored = 0;
-	for (const e of entries) {
-		const [root, ...rest] = e.name.split("/");
-		const rel = rest.join("/");
-		if (!rel || rel.split("/").includes("..")) continue;
-		const base = root === "agent" ? agentDir : root === "workspace" ? workspace : null;
-		if (!base) continue;
-		const target = join(base, rel);
-		mkdirSync(dirname(target), { recursive: true });
-		writeFileSync(target, e.data);
-		restored++;
-	}
-	return { restored };
+/** Backups are written and read in pieces (backup.ts), so a big workspace neither fills memory nor freezes the host. */
+async function backupCommand(includeWorkspace: boolean) {
+	const sources = { agentDir, workspace, includeWorkspace };
+	const r = await createBackup(sources, backupTarget());
+	return { path: r.path, files: r.files, bytes: r.bytes, left: r.left.slice(0, 20), leftCount: r.left.length };
+}
+
+async function restoreCommand(path: string) {
+	const r = await restoreBackup(String(path), { agent: agentDir, workspace });
+	return { restored: r.restored, skipped: r.skipped.slice(0, 20), skippedCount: r.skipped.length };
 }
 
 // ---------------------------------------------------------------------------
 // Commands
 
 async function handle(cmd: Command): Promise<unknown> {
+	// File access for the app does not depend on the chat session (fs.ts).
+	if (isFsCommand(cmd.type)) return runFsCommand(fsService, cmd);
+	// Web pages from the project folder, served on this machine's loopback for the app to reach (preview.ts).
+	if (cmd.type === "preview_serve") return preview.serve(cmd.dir);
+	if (cmd.type === "preview_stop") return { stopped: preview.stop(Number(cmd.port)) };
 	const s = session!;
 	const cwd = (cmd.dir as string | undefined) ?? s.sessionManager.getCwd();
 	switch (cmd.type) {
 		case "hello":
-			return { version: VERSION, node: process.version, agentDir, workspace, tools: s.getActiveToolNames(), ...state() };
+			return {
+				version: VERSION,
+				node: process.version,
+				agentDir,
+				workspace,
+				tools: s.getActiveToolNames(),
+				transport: listenPath ? "socket" : "stdio",
+				protocol: PROTOCOL,
+				...state(),
+			};
 		case "state":
 			return state();
 
 		case "prompt": {
 			checkBudget();
+			await health.assertRoom();
 			lastUserText = cmd.text;
 			fallbackTried = false;
 			// Plan mode: ask for a plan first; tools that change things are blocked (guard.ts).
@@ -764,12 +964,20 @@ async function handle(cmd: Command): Promise<unknown> {
 		case "approval_reply":
 			guard.reply(cmd.approvalId, !!cmd.allow, !!cmd.always, cmd.key);
 			return null;
+		// The checklist as of the current point of the conversation (agent/src/tasks.ts).
+		case "tasks_get":
+			return tasksRecord(s.sessionId, latestChecklist(s.sessionManager.getBranch()));
+		case "approvals_pending":
+			return guard.pendingApprovals();
+		case "host_restart":
+			if (!listenPath) throw new Error("Restarting is only available when the host runs as a daemon");
+			return restartGate.request(cmd.whenIdle !== false);
 		case "plan_mode":
 			guard.planMode = !!cmd.on;
 			return state();
 		case "plan_approve":
 			guard.planMode = false;
-			s.prompt(cmd.text || "The plan is approved. Carry it out now, step by step.").catch((e) =>
+			s.prompt(cmd.text || "The plan is approved. Write it down as a checklist with the tasks tool, then carry it out step by step.").catch((e) =>
 				send({ type: "error", message: String(e?.message ?? e) }),
 			);
 			return state();
@@ -856,15 +1064,20 @@ async function handle(cmd: Command): Promise<unknown> {
 		case "integrations":
 			return integrations.summary();
 		case "app_update_check":
-			return checkAppUpdate(agentDir, (p) => integrations.githubApi(p), !!(cmd as any).force);
+			return checkAppUpdate(agentDir, (p) => integrations.githubApi(p), !!(cmd as any).force, {
+				build: (cmd as any).currentBuild === undefined || !Number.isFinite(Number((cmd as any).currentBuild)) ? undefined : Number((cmd as any).currentBuild),
+				version: typeof (cmd as any).currentVersion === "string" ? (cmd as any).currentVersion : undefined,
+				abi: typeof (cmd as any).abi === "string" ? (cmd as any).abi : undefined,
+			});
 		case "app_update_download":
 			return startAppUpdateDownload(
 				agentDir,
 				(p) => integrations.githubApi(p),
 				(p, init) => integrations.githubRaw(p, init),
+				typeof (cmd as any).abi === "string" ? (cmd as any).abi : undefined,
 			);
 		case "app_update_status":
-			return appUpdateDownloadStatus(String((cmd as any).id ?? ""));
+			return appUpdateDownloadStatus(String((cmd as any).downloadId ?? ""));
 		case "github_login":
 			return integrations.githubLogin(cmd.token);
 		case "github_device_start":
@@ -1013,7 +1226,27 @@ async function handle(cmd: Command): Promise<unknown> {
 			return runner.summary();
 		case "run_enqueue":
 			checkBudget();
-			return runner.enqueue(String(cmd.prompt ?? ""), cwd, cmd.title);
+			await health.assertRoom();
+			return runner.enqueue(String(cmd.prompt ?? ""), cwd, cmd.title, "queue", cmd.task);
+		// Pick a chat up again after the host was cut off while it worked.
+		case "continue_session":
+			s.prompt(CONTINUE_CHAT).catch((e) => send({ type: "error", message: String(e?.message ?? e) }));
+			return state();
+		// Disk, memory, and what is running: for the app's server screen.
+		case "health": {
+			const snap = await health.check();
+			const runs = runner.summary();
+			return {
+				...snap,
+				mode,
+				transport: listenPath ? "socket" : "stdio",
+				epoch: hub.epoch,
+				uptimeSec: Math.round(process.uptime()),
+				node: process.version,
+				runs: { running: runs.running, queued: runs.runs.filter((r) => r.status === "queued").length },
+				clientInBackground: hub.clientInBackground(),
+			};
+		}
 		case "run_cancel":
 			await runner.cancel(cmd.runId);
 			return runner.summary();
@@ -1048,15 +1281,24 @@ async function handle(cmd: Command): Promise<unknown> {
 		}
 
 		// Backups.
+		case "backup_estimate":
+			return estimateBackup({ agentDir, workspace, includeWorkspace: !!cmd.includeWorkspace });
 		case "backup_create":
-			return createBackup(!!cmd.includeWorkspace);
+			return backupCommand(!!cmd.includeWorkspace);
 		case "backup_restore":
-			return restoreBackup(cmd.path);
+			return restoreCommand(cmd.path);
 
-		// Linux container (container.ts).
+		// Linux container. On the phone: container.ts (proot). On a server: the rootless Podman box (podmanbox.ts), which the
+		// setup script builds; the same commands serve both, so the screens do not need to know which one they talk to.
 		case "container_status":
-			return container.status(settingsManager.getShellPath());
+			return mode === "vps" ? box.status(settingsManager.getShellPath()) : container.status(settingsManager.getShellPath());
 		case "container_install": {
+			if (mode === "vps") {
+				// "Install" on a server means building the image again.
+				await guardBoxWork(cmd);
+				await box.rebuildImage(taskLog(cmd));
+				return box.status(settingsManager.getShellPath());
+			}
 			await container.install(cmd.distro as Distro, taskLog(cmd), integrations.settings.dns);
 			// On by default once installed, unless the user turned it off before.
 			if (integrations.settings.containerShell !== false) {
@@ -1067,17 +1309,42 @@ async function handle(cmd: Command): Promise<unknown> {
 			return container.status(settingsManager.getShellPath());
 		}
 		case "container_remove":
+			if (mode === "vps") {
+				// "Remove" on a server throws the container away; the image and the box's home stay, and the next command makes a new one.
+				await guardBoxWork(cmd);
+				await box.reset();
+				return box.status(settingsManager.getShellPath());
+			}
 			if (settingsManager.getShellPath() === container.shellPath) settingsManager.setShellPath(undefined);
 			container.remove();
 			await reopenSession();
 			return container.status(settingsManager.getShellPath());
 		case "container_enable":
+			if (mode === "vps") {
+				if (cmd.on && !box.available) throw new Error("There is no box on this server");
+				settingsManager.setShellPath(cmd.on ? boxScript : undefined);
+				integrations.updateSettings({ containerShell: !!cmd.on });
+				ensureAgentsFile(); // the notes tell the agent where its commands run
+				await settingsManager.flush();
+				await reopenSession();
+				return box.status(settingsManager.getShellPath());
+			}
 			if (cmd.on && !container.status(undefined).installed) throw new Error("Install the container first");
 			settingsManager.setShellPath(cmd.on ? container.shellPath : undefined);
 			integrations.updateSettings({ containerShell: !!cmd.on });
 			await settingsManager.flush();
 			await reopenSession();
 			return container.status(settingsManager.getShellPath());
+		// Server only: the box.
+		case "box_check":
+			return box.check();
+		case "box_stop":
+			await guardBoxWork(cmd);
+			await box.stop();
+			return box.status(settingsManager.getShellPath());
+		case "box_wipe_home":
+			await guardBoxWork(cmd);
+			return { ...(await box.wipeHome()), status: await box.status(settingsManager.getShellPath()) };
 
 		// App settings: DNS, search keys, approvals, fallbacks, budget.
 		case "settings_get":
@@ -1119,21 +1386,31 @@ function taskLog(cmd: Command): Log {
 	return log;
 }
 
-async function dispatch(line: string) {
-	let cmd: Command;
-	try {
-		cmd = JSON.parse(line);
-	} catch (e) {
-		send({ type: "response", ok: false, error: `Bad JSON: ${(e as Error).message}` });
-		return;
-	}
-	try {
-		const data = await handle(cmd);
-		send({ type: "response", id: cmd.id, ok: true, data });
-	} catch (e) {
-		send({ type: "response", id: cmd.id, ok: false, error: String((e as Error)?.message ?? e) });
-	}
+/** Nothing is in flight: no reply being written, no queued or running background run, no approval waiting. */
+function isIdle(): boolean {
+	const runs = runner?.summary();
+	return !session?.isStreaming && guard.pendingApprovals().length === 0 && !runs?.running && !runs?.runs.some((r) => r.status === "queued");
 }
+
+let shuttingDown = false;
+function shutdown(code = 0) {
+	if (shuttingDown) return;
+	shuttingDown = true;
+	tunnels.stopAll();
+	runner?.dispose();
+	void mcp?.dispose();
+	session?.dispose();
+	hub.close();
+	health.stop();
+	preview?.stopAll();
+	if (listenPath) {
+		rmSync(listenPath, { force: true });
+		rmSync(runningMarker, { force: true });
+	}
+	process.exit(code);
+}
+
+const restartGate = new RestartGate({ isIdle, exit: () => shutdown(0) });
 
 // ---------------------------------------------------------------------------
 // Startup
@@ -1153,6 +1430,13 @@ async function main() {
 	templates = new Templates(agentDir);
 	templates.seed(join(stateDir, "seeded-templates.json"));
 	checkpoints = new Checkpoints(join(stateDir, "checkpoints"));
+	// What the app may browse and edit: the workspace, plus read-only views of installed skills and downloaded updates.
+	preview = new Preview({ roots: [workspace], idleMs: Number(process.env.CODERRA_PREVIEW_IDLE_MS) || undefined });
+	fsService = new Fs([
+		{ path: workspace },
+		{ path: join(agentDir, "skills"), readOnly: true },
+		{ path: join(agentDir, "updates"), readOnly: true },
+	]);
 	container = new Container(process.env.ANDROPI_FILES ?? join(agentDir, "..", "..", ".."));
 	mcp = new Mcp(join(stateDir, "mcp.json"), () => send({ type: "mcp", servers: mcp.summary() }));
 	// The built-in free provider must be in models.json before the runtime
@@ -1173,8 +1457,35 @@ async function main() {
 		settingsManager.setShellPath(container.shellPath);
 		await settingsManager.flush();
 	}
+	// On a server, bash runs inside the rootless container once it has been set up (server/box/box), unless the user
+	// turned that off. If the launcher went away, stop pointing at it.
+	if (mode === "vps") {
+		const shell = settingsManager.getShellPath();
+		if (existsSync(boxScript) && integrations.settings.containerShell !== false && shell !== boxScript) {
+			settingsManager.setShellPath(boxScript);
+			await settingsManager.flush();
+		} else if (shell === boxScript && !existsSync(boxScript)) {
+			settingsManager.setShellPath(undefined);
+			await settingsManager.flush();
+		}
+	}
 	await openSession(SessionManager.continueRecent(workspace));
-	runner = new Runner(join(stateDir, "runs.json"), backgroundSession, send, (p) => integrations.githubApi(p));
+	runner = new Runner(
+		join(stateDir, "runs.json"),
+		backgroundSession,
+		(record) => {
+			send(record);
+			if ((record as { type?: string }).type === "run_finished") notifyRunFinished((record as { run: { status: string } }).run);
+		},
+		(p) => integrations.githubApi(p),
+		{
+			// Before each round of a long task: stop if the disk is full or the daily budget is spent.
+			preflight: async () => {
+				await health.assertRoom();
+				checkBudget();
+			},
+		},
+	);
 
 	// Starter skills and MCP connections come up in the background; the chat
 	// session is rebuilt afterwards (when idle) so it sees them.
@@ -1182,27 +1493,41 @@ async function main() {
 		if (session && !session.isStreaming) return reopenSession().catch(() => {});
 	});
 
-	// Split on LF only; readline would also split on U+2028/U+2029.
-	let buffer = "";
-	process.stdin.setEncoding("utf8");
-	process.stdin.on("data", (chunk: string) => {
-		buffer += chunk;
-		let nl: number;
-		while ((nl = buffer.indexOf("\n")) >= 0) {
-			const line = buffer.slice(0, nl).replace(/\r$/, "");
-			buffer = buffer.slice(nl + 1);
-			if (line.trim()) void dispatch(line);
+	// A daemon that was killed leaves its marker behind; finding it means the last run did not end cleanly.
+	if (listenPath) {
+		mkdirSync(coderraDir, { recursive: true, mode: 0o700 });
+		if (existsSync(runningMarker)) {
+			send({ type: "notice", message: "The host was restarted unexpectedly (it was stopped without shutting down)." });
+			void notifier.send("restarted", "Host restarted unexpectedly", { priority: 4, tags: ["warning"] });
 		}
-	});
-	process.stdin.on("end", () => {
-		tunnels.stopAll();
-		runner.dispose();
-		void mcp.dispose();
-		session?.dispose();
-		process.exit(0);
-	});
+		writeFileSync(runningMarker, `${process.pid} ${new Date().toISOString()}\n`, { mode: 0o600 });
+	}
+	if (session && endsUnfinished(session.sessionManager.getLeafEntry())) {
+		send({ type: "notice", message: "The last request was cut off before it finished. Tell the agent to continue, or press Continue." });
+	}
+	health.start();
+	// While a long task runs, say so now and then, so silence from the phone's side means "nothing to report" and not "dead".
+	const beat = setInterval(() => {
+		if (runner.runningTasks().length > 0) void notifier.send("heartbeat", "Task still running", { priority: 2, tags: ["hourglass_flowing_sand"] });
+	}, Number(process.env.CODERRA_HEARTBEAT_MS) || 6 * 3_600_000);
+	beat.unref();
 
-	send({ type: "ready", version: VERSION });
+	const readyRecord = { type: "ready", version: VERSION };
+	if (listenPath) {
+		// Listen last: a client that connects now finds everything above in place.
+		hub.setReady(readyRecord);
+		await listenOnSocket(hub, listenPath);
+		for (const signal of ["SIGTERM", "SIGINT"] as const) process.on(signal, () => shutdown(0));
+		log(`listening on ${listenPath}`);
+	} else {
+		const lines = new LineBuffer();
+		process.stdin.setEncoding("utf8");
+		process.stdin.on("data", (chunk: string) => {
+			for (const line of lines.push(chunk)) stdio?.receive(line);
+		});
+		process.stdin.on("end", () => shutdown(0));
+		hub.setReady(readyRecord);
+	}
 }
 
 main().catch((e) => {

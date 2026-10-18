@@ -8,6 +8,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { Type } from "typebox";
 import { readSecureJson, writeSecureJson } from "./secure.js";
 
@@ -83,7 +84,7 @@ export class Mcp {
 							s.inContainer
 								? { command: "box", args: ["-c", s.command!], env: { ...(process.env as any), ...s.env }, stderr: "pipe" }
 								: {
-										command: "/system/bin/sh",
+										command: process.platform === "android" || existsSync("/system/bin/sh") ? "/system/bin/sh" : "/bin/sh",
 										args: ["-c", s.command!],
 										env: { ...(process.env as any), ...s.env },
 										stderr: "pipe",

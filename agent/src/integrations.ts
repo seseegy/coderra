@@ -11,6 +11,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join, relative } from "node:path";
 import { configureDns, type DnsMode } from "./dns.js";
+import { checkConfig, type NotifyConfig } from "./notify.js";
 import { readSecureJson, writeSecureJson } from "./secure.js";
 
 export interface SshHost {
@@ -47,6 +48,8 @@ export interface AppSettings {
 	fallbackModels?: { provider: string; model: string }[];
 	/** Daily spend cap in USD; prompts are refused once reached. 0 or unset = none. */
 	dailyBudget?: number;
+	/** Pushes to the phone through ntfy while the app is closed. url and topic default to NTFY_URL and NTFY_TOPIC. */
+	notify?: { enabled?: boolean; url?: string; topic?: string };
 }
 
 const DEFAULT_SETTINGS: AppSettings = { dns: "cloudflare" };
@@ -113,12 +116,15 @@ export class Integrations {
 	}
 
 	get settings(): AppSettings {
-		return { ...DEFAULT_SETTINGS, ...this.store.settings };
+		// A server's own resolver works; the DNS-over-HTTPS default is a workaround for ISP blocking on phones.
+		const base: AppSettings = process.env.ANDROPI_MODE === "vps" ? { ...DEFAULT_SETTINGS, dns: "system" } : DEFAULT_SETTINGS;
+		return { ...base, ...this.store.settings };
 	}
 
 	/** Keys are write-only from the app's point of view: it only learns whether one is set. */
 	publicSettings() {
-		const { dns, dnsUrl, braveKey, tavilyKey, search1apiKeys, approvalMode, fallbackModels, dailyBudget } = this.settings;
+		const { dns, dnsUrl, braveKey, tavilyKey, search1apiKeys, approvalMode, fallbackModels, dailyBudget, notify } = this.settings;
+		const push = this.notifyConfig();
 		return {
 			dns,
 			dnsUrl: dnsUrl ?? null,
@@ -129,10 +135,25 @@ export class Integrations {
 			approvalMode: approvalMode ?? "ask_risky",
 			fallbackModels: fallbackModels ?? [],
 			dailyBudget: dailyBudget ?? 0,
+			// The topic is shown to its owner so they can subscribe to it; it is not a credential for anything else.
+			notify: { enabled: notify?.enabled !== false, url: push?.url ?? null, topic: push?.topic ?? null },
 		};
 	}
 
+	/** Where to send pushes, or null when they are off or not set up. */
+	notifyConfig(): NotifyConfig | null {
+		const n = this.settings.notify;
+		if (n?.enabled === false) return null;
+		const url = n?.url || process.env.NTFY_URL;
+		const topic = n?.topic || process.env.NTFY_TOPIC;
+		return url && topic ? { url, topic } : null;
+	}
+
 	updateSettings(patch: Partial<AppSettings> & { search1apiKeysAppend?: string }) {
+		if (patch.notify && (patch.notify.url || patch.notify.topic)) {
+			const problem = checkConfig({ url: patch.notify.url || process.env.NTFY_URL, topic: patch.notify.topic || process.env.NTFY_TOPIC });
+			if (problem) throw new Error(`Notifications: ${problem}`);
+		}
 		const next: AppSettings = { ...this.settings };
 		// Appending keys must not require the app to read the stored ones
 		// back, so it is a separate pseudo-field merged in here.
