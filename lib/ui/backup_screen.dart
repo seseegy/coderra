@@ -21,10 +21,7 @@ class BackupScreen extends StatefulWidget {
 }
 
 class _BackupScreenState extends State<BackupScreen> {
-  /// Remembered for the app's lifetime so Restore defaults to it.
-  static String? _lastBackup;
-
-  late final _path = TextEditingController(text: _lastBackup ?? '');
+  final _path = TextEditingController();
   bool _includeWorkspace = false;
   bool _backingUp = false;
   bool _restoring = false;
@@ -54,7 +51,6 @@ class _BackupScreenState extends State<BackupScreen> {
     setState(() => _backingUp = true);
     try {
       final r = await agent.features.backup(includeWorkspace: _includeWorkspace);
-      _lastBackup = r.path;
       if (mounted) {
         setState(() {
           _result = r;

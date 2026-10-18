@@ -2,50 +2,8 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { collectFiles, detectTests, readZip, Templates, usageSummary, writeZip } from "../src/workbench.js";
+import { detectTests, Templates, usageSummary } from "../src/workbench.js";
 import { tempDir } from "./helpers.js";
-
-// ---------------------------------------------------------------------------
-// Zip
-
-test("zip round-trips stored and deflated entries, UTF-8 names and empty files", () => {
-	const entries = [
-		{ name: "a.txt", data: Buffer.from("hello") },
-		{ name: "dir/ünï.txt", data: Buffer.alloc(10_000, "x") },
-		{ name: "empty", data: Buffer.alloc(0) },
-		{ name: "bin", data: Buffer.from([0, 255, 1, 254, 2, 253]) },
-	];
-	const zip = writeZip(entries);
-	const back = readZip(zip);
-	assert.deepEqual(
-		back.map((e) => e.name),
-		entries.map((e) => e.name),
-	);
-	for (const [i, e] of entries.entries()) assert.ok(back[i].data.equals(e.data), e.name);
-	// The 10 KB run of "x" must actually have been compressed.
-	assert.ok(zip.length < 5_000);
-});
-
-test("readZip rejects data that is not a zip", () => {
-	assert.throws(() => readZip(Buffer.from("definitely not a zip")), /Not a zip file/);
-});
-
-// ---------------------------------------------------------------------------
-// collectFiles
-
-test("collectFiles lists relative paths and skips heavy folders", (t) => {
-	const dir = tempDir(t);
-	for (const f of ["a.txt", "sub/b.txt", "node_modules/x.js", ".git/config", "bin/tool", ".cache/c"]) {
-		mkdirSync(join(dir, f, ".."), { recursive: true });
-		writeFileSync(join(dir, f), f);
-	}
-	assert.deepEqual(
-		collectFiles(dir, dir)
-			.map((e) => e.name)
-			.sort(),
-		["a.txt", "sub/b.txt"],
-	);
-});
 
 // ---------------------------------------------------------------------------
 // detectTests
