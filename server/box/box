@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# CoderRa box: runs commands inside a rootless Podman container, so the agent can `apt-get install` anything it
+# needs without any power over the server itself.
+#
+#   box -c 'apt-get install -y python3 && python3 x.py'   run one command (this is how the host's bash tool calls it)
+#   box                                                    a login shell in the container
+#   box --reset                                            throw the container away; the next call makes a new one
+#
+# The host points its bash tool at this script (settings.json shellPath), so every command the agent runs lands here.
+#
+# What the container sees:
+#   - the workspace, at the same path as outside (read-write), so files are shared both ways;
+#   - its own home folder at the same path as the real home (~/.coderra/box-home, kept between runs), with copies of
+#     the git and ssh settings the app configured. authorized_keys is never copied: it would let a command in the box
+#     plant access to the server.
+# Memory and CPU are capped (BOX_MEMORY, BOX_SWAP, BOX_CPUS in the environment or in ~/.coderra/box.conf).
+#
+# The container shares the server's network (--network=host) so a dev server started in it is reachable on
+# localhost:<port> for the app's tunnel. That also means it can reach everything the server can: use this on a
+# machine that runs nothing else you care about.
+set -eu
+
+HOME_DIR=${HOME:?box: HOME is not set}
+CODERRA_DIR=${CODERRA_DIR:-$HOME_DIR/.coderra}
+NAME=${CODERRA_BOX_NAME:-coderra-box}
+IMAGE=${CODERRA_BOX_IMAGE:-localhost/coderra-box}
+WS=${ANDROPI_WORKSPACE:-$HOME_DIR/workspace}
+BOXHOME=${CODERRA_BOX_HOME:-$CODERRA_DIR/box-home}
+CONF=${CODERRA_BOX_CONF:-$CODERRA_DIR/box.conf}
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+MEMORY=${BOX_MEMORY:-2g}
+SWAP=${BOX_SWAP:-3g}
+CPUS=${BOX_CPUS:-1.5}
+
+if [ "${1:-}" = "--reset" ]; then
+	podman rm -f "$NAME" >/dev/null 2>&1 || true
+	exit 0
+fi
+
+state() {
+	podman container inspect --format '{{.State.Status}}' "$NAME" 2>/dev/null || true
+}
+
+create() {
+	if ! podman image exists "$IMAGE"; then
+		echo "box: the container image $IMAGE is missing. Run server/bootstrap.sh again, or build it with" >&2
+		echo "     podman build -t $IMAGE -f ~/.coderra/box/Containerfile ~/.coderra/box" >&2
+		exit 127
+	fi
+	podman run -d --name "$NAME" --hostname "$NAME" --init --network=host \
+		--memory "$MEMORY" --memory-swap "$SWAP" --cpus "$CPUS" \
+		-v "$BOXHOME:$HOME_DIR" -v "$WS:$WS" -e "HOME=$HOME_DIR" -w "$WS" \
+		"$IMAGE" sleep infinity >/dev/null
+}
+
+# Two calls arriving together on first use must not both try to create the container.
+ensure_running() {
+	mkdir -p "$CODERRA_DIR" "$WS"
+	( umask 077; mkdir -p "$BOXHOME" )
+	exec 9>"$CODERRA_DIR/box.lock"
+	flock 9
+	case "$(state)" in
+		running) ;;
+		"") create ;;
+		*) podman start "$NAME" >/dev/null ;;
+	esac
+	exec 9>&-
+}
+
+# The app keeps the git and ssh settings in the server's real home; the container's home is a separate folder, so
+# copy what it needs. Files are replaced each time (git rewrites its config by renaming, which a single-file bind mount
+# would not follow); known_hosts is left alone once the container has its own, so hosts it learns are not lost.
+sync_settings() {
+	( umask 077
+	mkdir -p "$BOXHOME/.ssh"
+	for f in .gitconfig .ssh/config .ssh/id_ed25519 .ssh/id_ed25519.pub; do
+		if [ -f "$HOME_DIR/$f" ]; then
+			cp -f "$HOME_DIR/$f" "$BOXHOME/$f.tmp" && mv -f "$BOXHOME/$f.tmp" "$BOXHOME/$f"
+		else
+			rm -f "$BOXHOME/$f"
+		fi
+	done
+	if [ -f "$HOME_DIR/.ssh/known_hosts" ] && [ ! -f "$BOXHOME/.ssh/known_hosts" ]; then
+		cp "$HOME_DIR/.ssh/known_hosts" "$BOXHOME/.ssh/known_hosts"
+	fi )
+}
+
+ensure_running
+sync_settings
+
+# Run where the caller is when that is inside the workspace; anywhere else the container has nothing to show.
+cwd=$WS
+case "${PWD:-}" in
+	"$WS" | "$WS"/*) cwd=$PWD ;;
+	"$HOME_DIR") cwd=$HOME_DIR ;;
+esac
+
+flags=(-i)
+if [ -t 0 ] && [ -t 1 ]; then
+	flags+=(-t)
+else
+	flags+=(-e GIT_TERMINAL_PROMPT=0)
+fi
+flags+=(-e "TERM=${TERM:-xterm-256color}" -e LANG=C.UTF-8 -e DEBIAN_FRONTEND=noninteractive -e "HOME=$HOME_DIR")
+# By name only: podman takes the value from this environment, so the tokens never show up in a process listing.
+for v in GITHUB_TOKEN GH_TOKEN VERCEL_TOKEN; do
+	[ -n "${!v:-}" ] && flags+=(-e "$v")
+done
+
+[ "$#" -eq 0 ] && set -- -l
+exec podman exec "${flags[@]}" -w "$cwd" "$NAME" /bin/bash "$@"

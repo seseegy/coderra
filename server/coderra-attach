@@ -1,0 +1,47 @@
+#!/usr/bin/env node
+// Joins this process's stdin/stdout to the CoderRa host daemon's unix socket. The app runs it over ssh:
+//
+//   ssh coderra@server .coderra/bin/coderra-attach
+//
+// so the daemon's JSONL protocol travels through the ssh channel. Closing either side ends the other. Exit codes:
+// 0 the connection ended normally, 1 it broke, 3 the daemon is not running (the reason goes to stderr, which the app
+// shows when it cannot connect).
+//
+// Written in Node rather than socat or nc because Node is already required for the host and behaves the same
+// everywhere (nc variants differ in how they handle stdin closing).
+"use strict";
+const net = require("node:net");
+const os = require("node:os");
+const path = require("node:path");
+
+const sock = process.env.CODERRA_SOCK || path.join(process.env.HOME || os.homedir(), ".coderra", "host.sock");
+const socket = net.connect(sock);
+let connected = false;
+
+socket.once("connect", () => {
+	connected = true;
+	process.stdin.pipe(socket); // stdin ending half-closes the socket
+	socket.pipe(process.stdout, { end: false });
+});
+
+socket.on("error", (e) => {
+	if (!connected) {
+		const why = e.code === "ENOENT" || e.code === "ECONNREFUSED" ? "the host is not running" : e.message;
+		process.stderr.write(`coderra-attach: cannot connect to ${sock}: ${why} (${e.code})\n`);
+		process.exitCode = 3;
+	} else {
+		process.stderr.write(`coderra-attach: connection lost: ${e.message}\n`);
+		process.exitCode = 1;
+	}
+	process.stdin.destroy();
+});
+
+socket.on("close", () => {
+	// Let pending output drain, then leave by closing stdin so the event loop empties; no process.exit() that could
+	// cut off the last lines.
+	process.stdin.unpipe(socket);
+	process.stdin.destroy();
+});
+
+// ssh went away (the phone disconnected): drop the daemon side too.
+process.stdout.on("error", () => socket.destroy());

@@ -1,0 +1,39 @@
+# CoderRa agent host, as a systemd *user* service of the coderra account (rootless Podman needs that user's runtime
+# folder, and `loginctl enable-linger coderra` keeps it running without anyone logged in).
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coderra-hostd
+#
+# It is not started until the app has copied the host to ~/.coderra/host (ConditionPathExists below). After that the app
+# restarts it with `host_restart`: the host exits and Restart=always brings up a fresh process.
+[Unit]
+Description=CoderRa agent host
+ConditionPathExists=%h/.coderra/host/host.mjs
+After=network-online.target
+# Stop flapping if it keeps dying right away; the app will show it is not running.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# ANDROPI_STORE_KEY lives here. A missing file is an error on purpose: without the key, tokens would be written in the clear.
+EnvironmentFile=%h/.coderra/env
+Environment=ANDROPI_MODE=vps
+Environment=PI_CODING_AGENT_DIR=%h/.pi/agent
+Environment=ANDROPI_WORKSPACE=%h/workspace
+Environment=PI_SKIP_VERSION_CHECK=1
+Environment=PI_TELEMETRY=0
+Environment=NODE_OPTIONS=--max-old-space-size=1024
+Environment=PATH=%h/.coderra/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/node %h/.coderra/host/host.mjs --listen %h/.coderra/host.sock
+Restart=always
+RestartSec=2
+TimeoutStopSec=15
+# The host's own memory. The box (container) has its own limit, set in server/box/box.
+MemoryMax=1280M
+CPUWeight=200
+# No NoNewPrivileges=: the host starts `box`, which starts rootless podman, which needs the setuid newuidmap/newgidmap
+# helpers, and no_new_privs would stop them from working.
+
+[Install]
+WantedBy=default.target
