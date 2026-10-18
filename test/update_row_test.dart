@@ -145,6 +145,25 @@ void main() {
     expect(installs().single.arguments, '/srv/agent/updates/b130-app-arm64.apk');
   });
 
+  for (final (message, shown) in [
+    ('GitHub: Bad credentials (401)', 'GitHub sign-in expired'),
+    ('GitHub: API rate limit exceeded (403)', 'GitHub refused (403)'),
+    ('fetch failed', 'no connection to GitHub'),
+    ('something unexpected', 'something unexpected'),
+  ]) {
+    testWidgets('a check that fails says why: "$message"', (tester) async {
+      checkAnswer = {'status': 'error', 'currentBuild': 120, 'message': message};
+      await show(tester, onServer: true);
+      await until(tester, "Couldn't check ($shown");
+    });
+  }
+
+  testWidgets('a check that fails without a reason still says it failed', (tester) async {
+    checkAnswer = {'status': 'error', 'currentBuild': 120};
+    await show(tester, onServer: true);
+    await until(tester, "Couldn't check — tap to retry");
+  });
+
   testWidgets('a server that is not signed in to GitHub says where to sign in', (tester) async {
     checkAnswer = {'status': 'signed-out', 'currentBuild': 120};
     await show(tester, onServer: true);
