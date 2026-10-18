@@ -98,6 +98,24 @@ class MainActivity : FlutterFragmentActivity() {
                             }
                         }.start()
                     }
+                    // The agent runs on a server: the app hands over the command that reaches it (ssh ... coderra-attach).
+                    "startRemote" -> {
+                        val argv = call.argument<List<String>>("argv")
+                        val env = call.argument<Map<String, String>>("env") ?: emptyMap()
+                        if (argv.isNullOrEmpty()) {
+                            result.error("bad_args", "argv is required", null)
+                        } else {
+                            Thread {
+                                try {
+                                    AgentRuntime.startRemote(applicationContext, argv, env)
+                                    runOnUiThread { result.success(AgentRuntime.paths(applicationContext)) }
+                                } catch (e: Exception) {
+                                    runOnUiThread { result.error("start_failed", e.message, null) }
+                                }
+                            }.start()
+                        }
+                    }
+                    "appInfo" -> result.success(AgentRuntime.appInfo(applicationContext))
                     "send" -> {
                         AgentRuntime.send(call.arguments as String)
                         result.success(null)
