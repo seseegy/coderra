@@ -152,16 +152,20 @@ class RemoteSetup {
   // The key
 
   /// The app's key for the server, made on first use. Returns the public key, one line, to hand to the server script.
-  Future<String> ensureKey() async {
+  /// [env] is the launch environment the platform hands the agent (RemoteMode's): the bundled ssh-keygen is a
+  /// Termux build, and it only links with that environment's LD_LIBRARY_PATH pointing at the app's native
+  /// libraries — a bare Process.run inherits the app process's environment, which has no such path, and the
+  /// linker fails with "library libandroid-support.so not found".
+  Future<String> ensureKey({Map<String, String>? env}) async {
     Directory(sshDir).createSync(recursive: true);
     final pub = File('$keyPath.pub');
     if (!File(keyPath).existsSync()) {
       if (pub.existsSync()) pub.deleteSync(); // a public key without its private half is no use
-      final r = await Process.run(sshKeygen, ['-q', '-t', 'ed25519', '-N', '', '-C', 'coderra-app', '-f', keyPath]);
+      final r = await Process.run(sshKeygen, ['-q', '-t', 'ed25519', '-N', '', '-C', 'coderra-app', '-f', keyPath], environment: env);
       if (r.exitCode != 0) throw StateError('Could not make an ssh key: ${r.stderr}'.trim());
     }
     if (!pub.existsSync()) {
-      final r = await Process.run(sshKeygen, ['-y', '-f', keyPath]);
+      final r = await Process.run(sshKeygen, ['-y', '-f', keyPath], environment: env);
       if (r.exitCode != 0) throw StateError('Could not read the ssh key: ${r.stderr}'.trim());
       pub.writeAsStringSync('${(r.stdout as String).trim()} coderra-app\n');
     }

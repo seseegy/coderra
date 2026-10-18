@@ -91,7 +91,7 @@ class RemoteMode extends ChangeNotifier {
   }
 
   /// The app's public key for the server, made on first use.
-  Future<String> publicKey() => setup!.ensureKey();
+  Future<String> publicKey() => setup!.ensureKey(env: env.isEmpty ? null : env);
 
   /// The command the user runs on their server.
   Future<String> bootstrapCommand({String? address}) async => setup!.bootstrapCommand(await publicKey(), address: address);
