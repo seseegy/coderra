@@ -73,11 +73,21 @@ class _UpdateRowState extends State<UpdateRow> {
     try {
       final r = await agent.client.call<Map<String, dynamic>>('app_update_check', {'force': force, ...await _who()});
       if (mounted) setState(() => _result = r);
-    } catch (_) {
-      if (mounted) setState(() => _result = {'status': 'error'});
+    } catch (e) {
+      if (mounted) setState(() => _result = {'status': 'error', 'message': e is AgentError ? e.message : '$e'});
     } finally {
       if (mounted) setState(() => _busy = false);
     }
+  }
+
+  /// Why the check failed, in words a person can act on.
+  static String reason(String? message) {
+    final m = (message ?? '').trim();
+    if (m.isEmpty) return '';
+    if (RegExp(r'\(401\)|bad credentials', caseSensitive: false).hasMatch(m)) return 'GitHub sign-in expired: sign in again under Accounts';
+    if (RegExp(r'\(403\)|rate limit|resource not accessible', caseSensitive: false).hasMatch(m)) return 'GitHub refused (403): rate limit, or the token lacks the repo permission';
+    if (RegExp(r'fetch failed|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|network', caseSensitive: false).hasMatch(m)) return 'no connection to GitHub';
+    return m.length > 90 ? '${m.substring(0, 89)}…' : m;
   }
 
   Future<void> _startDownload() async {
@@ -220,7 +230,7 @@ class _UpdateRowState extends State<UpdateRow> {
         'current' => '$head — up to date',
         'none' => '$head — no builds published yet',
         'signed-out' => agent.fs.isLocal ? 'Sign in to GitHub in the app to check for updates' : 'Sign in to GitHub on the server (Accounts) to check for updates',
-        _ => "Couldn't check — tap to retry",
+        _ => "Couldn't check${r['message'] != null && '${r['message']}'.trim().isNotEmpty ? ' (${reason('${r['message']}')})' : ''} — tap to retry",
       };
     }
     return SettingsRow(
