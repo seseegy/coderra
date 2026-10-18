@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, symlink
 import { dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { BackupError, createBackup, DEFAULT_BACKUP_LIMITS, estimateBackup, listZip, restoreBackup } from "../src/backup.js";
-import { writeZip } from "../src/workbench.js";
+import { writeZip } from "./zip_helper.js";
 import { tempDir } from "./helpers.js";
 import { connect, startDaemon } from "./host_helpers.js";
 

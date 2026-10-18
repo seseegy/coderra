@@ -74,9 +74,16 @@ test("a folder asked for without the slash is redirected, so its relative links 
 test("without the token, or with a wrong one, there is nothing to see", async (t) => {
 	const { site, preview } = setup(t);
 	const { port, token } = await preview.serve(site);
-	for (const path of ["/", "/page.html", `/${token.slice(0, -1)}0/page.html`, `/x/${token}/page.html`, `/${token.toUpperCase()}/page.html`]) {
+	// Wrong tokens that are certainly different from the real one (the real one ends in "0" one time in sixteen, and has no
+	// letters to capitalise very rarely).
+	const lastWrong = `${token.slice(0, -1)}${token.endsWith("0") ? "1" : "0"}`;
+	const firstWrong = `${token.startsWith("0") ? "1" : "0"}${token.slice(1)}`;
+	const paths = ["/", "/page.html", `/${lastWrong}/page.html`, `/${firstWrong}/page.html`, `/x/${token}/page.html`, `/${token}x/page.html`, `/${token.slice(1)}/page.html`];
+	if (token.toUpperCase() !== token) paths.push(`/${token.toUpperCase()}/page.html`);
+	for (const path of paths) {
 		assert.equal((await get(port, path)).status, 404, path);
 	}
+	assert.equal((await get(port, `/${token}/page.html`)).status, 200, "and the real one works");
 });
 
 test("nothing outside the folder is reachable: dot segments, encodings, links, hidden files", async (t) => {

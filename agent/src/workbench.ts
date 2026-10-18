@@ -6,8 +6,7 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, relative } from "node:path";
-import { deflateRawSync, inflateRawSync } from "node:zlib";
+import { basename, dirname, join } from "node:path";
 
 // ---------------------------------------------------------------------------
 // Search (ripgrep)
@@ -287,105 +286,3 @@ export class Templates {
 }
 
 // ---------------------------------------------------------------------------
-// Zip (stored/deflated) for backups, without native tools.
-
-const CRC_TABLE = (() => {
-	const t = new Uint32Array(256);
-	for (let n = 0; n < 256; n++) {
-		let c = n;
-		for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-		t[n] = c >>> 0;
-	}
-	return t;
-})();
-
-function crc32(buf: Buffer) {
-	let c = 0xffffffff;
-	for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
-	return (c ^ 0xffffffff) >>> 0;
-}
-
-export function writeZip(entries: { name: string; data: Buffer }[]): Buffer {
-	const locals: Buffer[] = [];
-	const centrals: Buffer[] = [];
-	let offset = 0;
-	for (const e of entries) {
-		const name = Buffer.from(e.name.replace(/\\/g, "/"), "utf8");
-		const deflated = deflateRawSync(e.data);
-		const useDeflate = deflated.length < e.data.length;
-		const body = useDeflate ? deflated : e.data;
-		const crc = crc32(e.data);
-		const local = Buffer.alloc(30);
-		local.writeUInt32LE(0x04034b50, 0);
-		local.writeUInt16LE(20, 4);
-		local.writeUInt16LE(0x0800, 6); // UTF-8 names
-		local.writeUInt16LE(useDeflate ? 8 : 0, 8);
-		local.writeUInt32LE(crc, 14);
-		local.writeUInt32LE(body.length, 18);
-		local.writeUInt32LE(e.data.length, 22);
-		local.writeUInt16LE(name.length, 26);
-		locals.push(local, name, body);
-		const central = Buffer.alloc(46);
-		central.writeUInt32LE(0x02014b50, 0);
-		central.writeUInt16LE(20, 4);
-		central.writeUInt16LE(20, 6);
-		central.writeUInt16LE(0x0800, 8);
-		central.writeUInt16LE(useDeflate ? 8 : 0, 10);
-		central.writeUInt32LE(crc, 16);
-		central.writeUInt32LE(body.length, 20);
-		central.writeUInt32LE(e.data.length, 24);
-		central.writeUInt16LE(name.length, 28);
-		central.writeUInt32LE(offset, 42);
-		centrals.push(central, name);
-		offset += 30 + name.length + body.length;
-	}
-	const cd = Buffer.concat(centrals);
-	const end = Buffer.alloc(22);
-	end.writeUInt32LE(0x06054b50, 0);
-	end.writeUInt16LE(entries.length, 8);
-	end.writeUInt16LE(entries.length, 10);
-	end.writeUInt32LE(cd.length, 12);
-	end.writeUInt32LE(offset, 16);
-	return Buffer.concat([...locals, cd, end]);
-}
-
-export function readZip(buf: Buffer): { name: string; data: Buffer }[] {
-	const eocd = buf.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
-	if (eocd < 0) throw new Error("Not a zip file");
-	const count = buf.readUInt16LE(eocd + 10);
-	let p = buf.readUInt32LE(eocd + 16);
-	const out: { name: string; data: Buffer }[] = [];
-	for (let i = 0; i < count; i++) {
-		const method = buf.readUInt16LE(p + 10);
-		const size = buf.readUInt32LE(p + 20);
-		const nameLen = buf.readUInt16LE(p + 28);
-		const extra = buf.readUInt16LE(p + 30);
-		const comment = buf.readUInt16LE(p + 32);
-		const local = buf.readUInt32LE(p + 42);
-		const name = buf.subarray(p + 46, p + 46 + nameLen).toString("utf8");
-		const lNameLen = buf.readUInt16LE(local + 26);
-		const lExtra = buf.readUInt16LE(local + 28);
-		const start = local + 30 + lNameLen + lExtra;
-		const raw = buf.subarray(start, start + size);
-		if (!name.endsWith("/")) out.push({ name, data: method === 8 ? inflateRawSync(raw) : Buffer.from(raw) });
-		p += 46 + nameLen + extra + comment;
-	}
-	return out;
-}
-
-/** Every file under `dir`, relative to `base`, skipping heavy/derived folders. */
-export function collectFiles(dir: string, base: string, skip = new Set(["node_modules", ".git", "bin", ".cache"])) {
-	const out: { name: string; data: Buffer }[] = [];
-	const walk = (d: string) => {
-		if (!existsSync(d)) return;
-		for (const name of readdirSync(d)) {
-			if (skip.has(name)) continue;
-			const p = join(d, name);
-			const st = statSync(p);
-			if (st.isDirectory()) walk(p);
-			else if (st.isFile() && st.size < 25 * 1024 * 1024) out.push({ name: relative(base, p), data: readFileSync(p) });
-		}
-	};
-	walk(dir);
-	return out;
-}
