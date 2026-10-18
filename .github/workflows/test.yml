@@ -1,0 +1,103 @@
+# Runs the unit tests on every pull request and push to main:
+#   - agent/  : the Node host, with node:test (cd agent && npm test). Includes the tests that start real processes:
+#               the host itself, a private sshd, and (where a systemd user manager exists) the service unit
+#   - server/ : the setup scripts (shellcheck, and a real run of bootstrap.sh in a container)
+#   - app     : the Flutter app (flutter test)
+# The app job also needs Node (the client tests run against the real Node host and attach program) and sshd/rsync
+# (the server-agent tests run the whole ssh chain on loopback).
+# The APK build lives in build-apk.yml and is not a prerequisite for these.
+
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  agent:
+    name: Agent host (node:test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: agent/package-lock.json
+
+      - name: Install
+        working-directory: agent
+        run: npm ci
+
+      - name: Test
+        working-directory: agent
+        run: npm test
+
+  server:
+    name: Server scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: shellcheck
+        run: shellcheck server/bootstrap.sh server/box/box server/test/*.sh
+
+      # Runs bootstrap.sh for real (apt, useradd, authorized_keys, the Node download) in a throwaway container.
+      - name: bootstrap.sh in a container
+        run: server/test/bootstrap-in-container.sh debian:stable-slim
+
+  app:
+    name: Flutter app
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # The RemoteFs tests talk to the real Node implementation of the file protocol, so Node and the built test
+      # harness (agent/.test-out/harness) are needed here too.
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: agent/package-lock.json
+
+      - name: Build the Node side of the protocol
+        working-directory: agent
+        run: |
+          npm ci
+          npm test
+
+      # The server-agent tests run a private sshd, rsync and tmux (loopback, throwaway keys); the runner may not have them.
+      - name: Install sshd, rsync and tmux
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server rsync tmux
+
+      - name: Set up Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install
+        run: flutter pub get
+
+      - name: Test
+        env:
+          CODERRA_REQUIRE_NODE_SIDE: "1"
+        run: flutter test
