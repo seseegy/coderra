@@ -16,11 +16,13 @@ import 'illustration.dart';
 import 'mcp_screen.dart';
 import 'mesh.dart';
 import 'network_screen.dart';
+import 'server_screen.dart';
 import 'settings_screen.dart';
 import 'skills_screen.dart';
 import 'tasks_screen.dart';
 import 'templates_screen.dart';
 import 'theme.dart';
+import 'update_row.dart';
 import 'usage_screen.dart';
 
 /// The settings home: everything the agent can use, grouped.
@@ -203,8 +205,14 @@ class _SettingsHubState extends State<SettingsHub> {
                   SettingsRow(
                     icon: c?.distro == 'alpine' ? SimpleIcons.alpinelinux : SimpleIcons.debian,
                     color: c?.distro == 'alpine' ? const Color(0xFF0D597F) : const Color(0xFFD70A53),
-                    title: tr('Linux container'),
-                    subtitle: c == null
+                    title: agent.remote.active ? tr('The agent\'s box') : tr('Linux container'),
+                    subtitle: agent.remote.active
+                        ? (c == null
+                              ? tr('The container the agent\'s commands run in on your server')
+                              : !c.available
+                              ? tr('No box on this server')
+                              : '${switch (c.state) { 'running' => tr('Running'), 'stopped' => tr('Stopped'), 'none' => tr('Not started yet'), _ => tr('Unknown') }}${c.enabled ? ' · ${tr('agent shell')}' : ' · ${tr('off')}'}')
+                        : c == null
                         ? 'Debian or Alpine with apt / apk'
                         : c.installed
                         ? '${c.image}${c.enabled ? ' · agent shell' : ''}'
@@ -222,6 +230,17 @@ class _SettingsHubState extends State<SettingsHub> {
                       if (it.hosts.isNotEmpty) '${it.hosts.length} server${it.hosts.length == 1 ? '' : 's'}',
                     ].join(' · ').ifEmpty('GitHub, Vercel, SSH keys and servers'),
                     onTap: () => _open(AccountsScreen(agent: agent)),
+                  ),
+                  SettingsRow(
+                    icon: LucideIcons.server,
+                    color: const Color(0xFF10B981),
+                    title: tr('Server agent'),
+                    subtitle: agent.remote.active
+                        ? '${agent.remote.profile!.address} · ${tr(agent.client.connection.value.connected ? 'Connected' : 'Offline')}'
+                        : agent.remote.configured
+                        ? '${agent.remote.profile!.address} · ${tr('Not in use')}'
+                        : tr('Let the agent work around the clock on your own server'),
+                    onTap: () => _open(ServerScreen(agent: agent)),
                   ),
                   SettingsRow(
                     icon: LucideIcons.globe,
@@ -398,7 +417,7 @@ class _SettingsHubState extends State<SettingsHub> {
               SectionLabel(tr('About')),
               SettingsGroup(
                 children: [
-                  _UpdateRow(agent: agent),
+                  UpdateRow(agent: agent),
                   _InfoRow('Workspace', agent.info['workspace']?.toString() ?? '—'),
                   _InfoRow('Agent directory', agent.info['agentDir']?.toString() ?? '—'),
                   Padding(
@@ -546,183 +565,6 @@ class _DeveloperCard extends StatelessWidget {
           ),
         ],
       ),
-    );
-  }
-}
-
-/// The fork maintainer: CoderRa is a fork of AndroPI, modified by Rosyid.
-/// About row (CoderRa fork addition): checks the GitHub Releases of
-/// seseegy/coderra for a newer build. The host compares build numbers
-/// (CI sets versionCode = Actions run number) and caches successful
-/// checks for 6 hours. When an update exists, tapping downloads the APK
-/// inside the app (the host fetches the release asset with the user's
-/// GitHub token) and then hands it to the system installer.
-class _UpdateRow extends StatefulWidget {
-  const _UpdateRow({required this.agent});
-
-  final AgentController agent;
-
-  @override
-  State<_UpdateRow> createState() => _UpdateRowState();
-}
-
-class _UpdateRowState extends State<_UpdateRow> {
-  Map<String, dynamic>? _result;
-  bool _busy = false;
-  // Direct-download state: idle | downloading | ready | error.
-  String _dlState = 'idle';
-  int _received = 0;
-  int _total = 0;
-  String? _path;
-  String? _dlMessage;
-  String? _installNote;
-  Timer? _pollTimer;
-
-  @override
-  void initState() {
-    super.initState();
-    _check(false);
-  }
-
-  @override
-  void dispose() {
-    _pollTimer?.cancel();
-    super.dispose();
-  }
-
-  Future<void> _check(bool force) async {
-    if (_busy) return;
-    setState(() => _busy = true);
-    try {
-      final r = await widget.agent.client
-          .call<Map<String, dynamic>>('app_update_check', {'force': force});
-      if (mounted) setState(() => _result = r);
-    } catch (_) {
-      if (mounted) setState(() => _result = {'status': 'error'});
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
-  }
-
-  Future<void> _startDownload() async {
-    try {
-      final r = await widget.agent.client.call<Map<String, dynamic>>('app_update_download');
-      if (!mounted) return;
-      setState(() {
-        _dlState = 'downloading';
-        _received = 0;
-        _total = (r['size'] as num?)?.toInt() ?? 0;
-        _installNote = null;
-        _dlMessage = null;
-      });
-      final id = r['id']?.toString() ?? '';
-      _pollTimer?.cancel();
-      _pollTimer = Timer.periodic(const Duration(milliseconds: 700), (_) => _poll(id));
-    } catch (_) {
-      if (mounted) {
-        setState(() {
-          _dlState = 'error';
-          _dlMessage = 'could not start';
-        });
-      }
-    }
-  }
-
-  Future<void> _poll(String id) async {
-    try {
-      final st = await widget.agent.client
-          .call<Map<String, dynamic>>('app_update_status', {'id': id});
-      if (!mounted) return;
-      final state = st['state']?.toString() ?? 'error';
-      setState(() {
-        _received = (st['received'] as num?)?.toInt() ?? _received;
-        _total = (st['total'] as num?)?.toInt() ?? _total;
-        if (state == 'done') {
-          _dlState = 'ready';
-          _path = st['path']?.toString();
-        } else if (state == 'error') {
-          _dlState = 'error';
-          _dlMessage = st['message']?.toString();
-        }
-      });
-      if (state != 'downloading') _pollTimer?.cancel();
-    } catch (_) {
-      // Polling glitch; the timer keeps trying.
-    }
-  }
-
-  Future<void> _install() async {
-    final path = _path;
-    if (path == null) return;
-    final res = await widget.agent.client.installApk(path);
-    if (!mounted) return;
-    setState(() {
-      _installNote = switch (res) {
-        'launched' => 'Installer opened — confirm to finish updating',
-        'needs-permission' => 'Allow installs for CoderRa on the screen that opened, then tap again',
-        _ => 'Could not open the installer',
-      };
-    });
-  }
-
-  String _mb(int bytes) => '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-
-  @override
-  Widget build(BuildContext context) {
-    final p = context.palette;
-    final r = _result;
-    final status = r?['status']?.toString();
-    final available = status == 'available';
-    final String sub;
-    if (_dlState == 'downloading') {
-      final pct = _total > 0 ? (_received * 100 ~/ _total) : 0;
-      sub = 'Downloading build b${r?['latestBuild']}… $pct% (${_mb(_received)} of ${_mb(_total)})';
-    } else if (_dlState == 'ready') {
-      sub = _installNote ?? 'Build b${r?['latestBuild']} downloaded — tap to install';
-    } else if (_dlState == 'error') {
-      sub = 'Download failed${_dlMessage != null ? ' ($_dlMessage)' : ''} — tap to retry';
-    } else if (r == null) {
-      sub = _busy ? 'Checking…' : 'Tap to check for updates';
-    } else {
-      final curV = (r['currentVersion'] ?? '').toString();
-      final head = curV.isEmpty ? 'Build b${r['currentBuild']}' : 'Version $curV · build b${r['currentBuild']}';
-      sub = switch (status) {
-        'available' => '$head — build b${r['latestBuild']} available, tap to download',
-        'current' => '$head — up to date',
-        'none' => '$head — no builds published yet',
-        'signed-out' => 'Sign in to GitHub in the app to check for updates',
-        _ => "Couldn't check — tap to retry",
-      };
-    }
-    final pct = _total > 0 ? (_received * 100 ~/ _total) : 0;
-    return SettingsRow(
-      icon: LucideIcons.refreshCw,
-      color: available ? const Color(0xFF22C55E) : p.accent,
-      title: tr('App updates'),
-      subtitle: sub,
-      trailing: _dlState == 'downloading'
-          ? Text('$pct%', style: Theme.of(context).textTheme.bodySmall)
-          : _dlState == 'ready'
-              ? const Icon(LucideIcons.check, size: 18)
-              : _busy
-                  ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : available
-                      ? const Icon(LucideIcons.download, size: 18)
-                      : null,
-      onTap: () {
-        if (_dlState == 'downloading') return;
-        if (_dlState == 'ready') {
-          _install();
-        } else if (available) {
-          _startDownload();
-        } else {
-          _check(true);
-        }
-      },
     );
   }
 }

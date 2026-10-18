@@ -69,6 +69,47 @@ class ContainerStatus {
   List<(String, String)> get distros => [
     for (final d in (json['distros'] as List? ?? const [])) ((d as Map)['id'] as String, d['label'] as String),
   ];
+
+  // Only a server's box (Podman) has these.
+
+  /// This is the server's rootless container, not the phone's proot one.
+  bool get isBox => json['kind'] == 'podman';
+
+  /// The launcher exists on the server. Without it there is no box.
+  bool get available => json['available'] != false;
+
+  /// `running`, `stopped`, `none` (not made yet: the first command makes it) or `unknown`.
+  String get state => json['state'] as String? ?? 'none';
+
+  /// Something wrong with the box, in words.
+  String? get problem => json['problem'] as String?;
+
+  DateTime? get startedAt => DateTime.tryParse(json['startedAt'] as String? ?? '');
+
+  BoxUsage? get usage {
+    final u = json['usage'];
+    if (u is! Map) return null;
+    return BoxUsage(
+      memoryBytes: (u['memoryBytes'] as num).toInt(),
+      memoryLimitBytes: (u['memoryLimitBytes'] as num?)?.toInt(),
+      processes: (u['processes'] as num).toInt(),
+    );
+  }
+
+  /// `memory`, `swap` and `cpus` the container is made with.
+  Map<String, String> get limits => {
+    for (final e in ((json['limits'] as Map?) ?? const {}).entries) '${e.key}': '${e.value}',
+  };
+}
+
+class BoxUsage {
+  const BoxUsage({required this.memoryBytes, required this.memoryLimitBytes, required this.processes});
+
+  final int memoryBytes;
+
+  /// Null when the box has no memory limit.
+  final int? memoryLimitBytes;
+  final int processes;
 }
 
 class SkillInfo {
@@ -116,6 +157,13 @@ class AppSettings {
   List<Map<String, dynamic>> get fallbackModels =>
       (json['fallbackModels'] as List? ?? const []).map((e) => (e as Map).cast<String, dynamic>()).toList();
   double get dailyBudget => (json['dailyBudget'] as num?)?.toDouble() ?? 0;
+
+  /// Pushes to the phone through ntfy while the app is closed (server agent). The topic is the address of the user's own
+  /// feed, so it is shown to them and nobody else.
+  Map<String, dynamic> get notify => (json['notify'] as Map?)?.cast<String, dynamic>() ?? const {};
+  bool get notifyEnabled => notify['enabled'] != false;
+  String? get notifyUrl => notify['url'] as String?;
+  String? get notifyTopic => notify['topic'] as String?;
 }
 
 /// Accounts, repositories, SSH and deploys, backed by the host's
@@ -271,19 +319,40 @@ class Integrations extends ChangeNotifier {
     return container!;
   }
 
-  Future<void> installContainer(String distro, {void Function(String)? onLine}) async {
-    await _task('container_install', {'distro': distro}, onLine);
+  /// On the phone: installs a Linux. On a server: builds the box's image again.
+  Future<void> installContainer(String distro, {void Function(String)? onLine, bool force = false}) async {
+    await _task('container_install', {'distro': distro, if (force) 'force': true}, onLine);
     await refreshContainer();
   }
 
-  Future<void> removeContainer() async {
-    container = ContainerStatus((await client.call<Map>('container_remove')).cast<String, dynamic>());
+  /// On the phone: removes the Linux. On a server: throws the box's container away (a new one is made on the next command).
+  Future<void> removeContainer({bool force = false}) async {
+    container = ContainerStatus((await client.call<Map>('container_remove', {if (force) 'force': true})).cast<String, dynamic>());
     notifyListeners();
   }
 
   Future<void> setContainerShell(bool on) async {
     container = ContainerStatus((await client.call<Map>('container_enable', {'on': on})).cast<String, dynamic>());
     notifyListeners();
+  }
+
+  /// Runs a command inside the server's box to see that it works.
+  Future<({bool ok, String message})> checkBox() async {
+    final r = (await client.call<Map>('box_check')).cast<String, dynamic>();
+    return (ok: r['ok'] == true, message: r['message'] as String? ?? '');
+  }
+
+  Future<void> stopBox({bool force = false}) async {
+    container = ContainerStatus((await client.call<Map>('box_stop', {if (force) 'force': true})).cast<String, dynamic>());
+    notifyListeners();
+  }
+
+  /// Empties the box's home folder (after removing its container). Returns how many things were removed.
+  Future<int> wipeBoxHome({bool force = false}) async {
+    final r = (await client.call<Map>('box_wipe_home', {if (force) 'force': true})).cast<String, dynamic>();
+    container = ContainerStatus((r['status'] as Map).cast<String, dynamic>());
+    notifyListeners();
+    return (r['removed'] as num).toInt();
   }
 
   // Skills

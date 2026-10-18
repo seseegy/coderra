@@ -4,6 +4,7 @@ import 'package:simple_icons/simple_icons.dart';
 
 import '../agent/agent_controller.dart';
 import '../agent/integrations.dart';
+import 'box_screen.dart';
 import 'kit.dart';
 import 'task_log.dart';
 import 'terminal_screen.dart';
@@ -106,6 +107,8 @@ class _ContainerScreenState extends State<ContainerScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // On a server the container is a rootless Podman box, with its own screen.
+    if (widget.agent.remote.active) return BoxScreen(agent: widget.agent);
     final p = context.palette;
     final text = Theme.of(context).textTheme;
     return ListenableBuilder(

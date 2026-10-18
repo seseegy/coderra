@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
@@ -54,16 +52,24 @@ class _NewChatSheetState extends State<_NewChatSheet> {
     return 'project-${two(n.month)}${two(n.day)}-${two(n.hour)}${two(n.minute)}';
   }
 
-  void _createProject() {
+  Future<void> _createProject() async {
     final clean = name.text.trim().replaceAll(RegExp(r'[/\\:*?"<>|\s]+'), '-');
     if (clean.isEmpty) return;
-    final dir = Directory('$workspace/$clean');
-    if (dir.existsSync() && dir.listSync().isNotEmpty) {
-      setState(() => error = '"$clean" already exists. Pick another name, or open it as an existing folder.');
+    final fs = widget.agent.fs;
+    final dir = '$workspace/$clean';
+    try {
+      if (await fs.exists(dir) && (await fs.list(dir)).isNotEmpty) {
+        if (mounted) {
+          setState(() => error = '"$clean" already exists. Pick another name, or open it as an existing folder.');
+        }
+        return;
+      }
+      await fs.mkdir(dir);
+    } catch (e) {
+      if (mounted) setState(() => error = 'Could not create "$clean": $e');
       return;
     }
-    dir.createSync(recursive: true);
-    Navigator.pop(context, dir.path);
+    if (mounted) Navigator.pop(context, dir);
   }
 
   @override

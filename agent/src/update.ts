@@ -31,65 +31,95 @@ export interface UpdateCheck {
 	message?: string;
 }
 
-/** The release APK asset: prefer the arm64 build, else the first APK. */
-function pickAsset(rel: any): { id: number; name: string; size: number } | null {
+/** Which build of the app is asking: its own numbers (a server's environment says nothing about the phone) and its CPU. */
+export interface AppIdentity {
+	build?: number;
+	version?: string;
+	/** `arm64-v8a`, `armeabi-v7a` or `x86_64`: the release has one APK for each. */
+	abi?: string;
+}
+
+/** The release APK asset for [abi] (arm64 when not said or not found), else the first APK. */
+export function pickAsset(rel: any, abi?: string): { id: number; name: string; size: number } | null {
 	const assets = Array.isArray(rel?.assets) ? rel.assets : [];
 	const apks = assets.filter(
 		(a: any) => typeof a?.name === "string" && a.name.endsWith(".apk") && typeof a?.id === "number",
 	);
-	const pick = apks.find((a: any) => a.name.includes("arm64")) ?? apks[0];
+	const wanted = abi && /^[a-z0-9_-]+$/i.test(abi) ? abi : "arm64";
+	const pick = apks.find((a: any) => a.name.includes(wanted)) ?? apks.find((a: any) => a.name.includes("arm64")) ?? apks[0];
 	return pick ? { id: pick.id, name: pick.name, size: Number(pick.size) || 0 } : null;
+}
+
+interface Latest {
+	latestBuild: number;
+	tag: string;
+	title: string;
+	url: string;
+	assets: unknown;
 }
 
 export async function checkAppUpdate(
 	agentDir: string,
 	githubApi: (path: string) => Promise<any>,
 	force = false,
+	app: AppIdentity = {},
 ): Promise<UpdateCheck> {
-	const currentBuild = Number.parseInt(process.env.ANDROPI_APP_BUILD ?? "", 10) || 0;
-	const currentVersion = process.env.ANDROPI_APP_VERSION ?? "";
+	// The app says which build it is; the environment is only what a host running on the phone itself knows.
+	const currentBuild = app.build ?? (Number.parseInt(process.env.ANDROPI_APP_BUILD ?? "", 10) || 0);
+	const currentVersion = app.version ?? process.env.ANDROPI_APP_VERSION ?? "";
 	const base = { currentBuild, currentVersion };
 	const stateDir = join(agentDir, "andropi");
 	const cacheFile = join(stateDir, "update-check.json");
 
+	// What is cached is the newest release, never the verdict: the verdict depends on who is asking.
+	const answer = (latest: Latest): UpdateCheck => {
+		const asset = pickAsset({ assets: latest.assets }, app.abi);
+		return {
+			...base,
+			status: latest.latestBuild > currentBuild ? "available" : "current",
+			latestBuild: latest.latestBuild,
+			tag: latest.tag,
+			title: latest.title,
+			url: latest.url,
+			...(asset ? { assetName: asset.name, assetSize: asset.size } : {}),
+		};
+	};
+
 	if (!force) {
 		try {
 			const c = JSON.parse(readFileSync(cacheFile, "utf8"));
-			if (Date.now() - Number(c.at ?? 0) < CACHE_MS && c.result) {
-				return { ...c.result, ...base };
+			if (c.v === 2 && Date.now() - Number(c.at ?? 0) < CACHE_MS) {
+				return c.latest ? answer(c.latest as Latest) : { ...base, status: "none" };
 			}
 		} catch {
 			// No (readable) cache yet.
 		}
 	}
 
+	let latest: Latest | null = null;
 	let result: UpdateCheck;
 	try {
 		const rel = await githubApi(`/repos/${REPO}/releases/latest`);
 		const tag = String(rel?.tag_name ?? "");
-		const latestBuild = Number.parseInt(tag.replace(/^b/, ""), 10) || 0;
-		const asset = pickAsset(rel);
-		result = {
-			...base,
-			status: latestBuild > currentBuild ? "available" : "current",
-			latestBuild,
+		latest = {
+			latestBuild: Number.parseInt(tag.replace(/^b/, ""), 10) || 0,
 			tag,
 			title: typeof rel?.name === "string" ? rel.name : tag,
 			url: typeof rel?.html_url === "string" ? rel.html_url : "",
-			...(asset ? { assetName: asset.name, assetSize: asset.size } : {}),
+			assets: Array.isArray(rel?.assets) ? rel.assets.map((a: any) => ({ id: a?.id, name: a?.name, size: a?.size })) : [],
 		};
+		result = answer(latest);
 	} catch (e: any) {
 		if (e?.status === 404) result = { ...base, status: "none" };
 		else if (/not signed in/i.test(String(e?.message ?? e))) result = { ...base, status: "signed-out" };
 		else result = { ...base, status: "error", message: String(e?.message ?? e).slice(0, 160) };
 	}
 
-	// Only cache real answers; a sign-in or a network blip must not stick
-	// around for six hours.
+	// Only cache real answers; a sign-in or a network blip must not stick around for six hours.
 	if (result.status === "available" || result.status === "current" || result.status === "none") {
 		try {
 			mkdirSync(stateDir, { recursive: true });
-			writeFileSync(cacheFile, JSON.stringify({ at: Date.now(), result }));
+			writeFileSync(cacheFile, JSON.stringify({ v: 2, at: Date.now(), latest }));
 		} catch {
 			// Cache is best-effort.
 		}
@@ -119,14 +149,16 @@ export async function startAppUpdateDownload(
 	agentDir: string,
 	githubApi: (path: string) => Promise<any>,
 	githubRaw: (path: string, init?: RequestInit) => Promise<Response>,
+	abi?: string,
 ): Promise<{ id: string; name: string; size: number; tag: string }> {
 	const rel = await githubApi(`/repos/${REPO}/releases/latest`);
-	const asset = pickAsset(rel);
+	const asset = pickAsset(rel, abi);
 	if (!asset) throw new Error("The latest release has no APK attached");
 	const tag = String(rel?.tag_name ?? "b0");
 	const dir = join(agentDir, "updates");
 	mkdirSync(dir, { recursive: true });
-	const file = join(dir, `${tag}-${asset.name}`);
+	// The names come from GitHub: whatever they hold, the file stays in this folder.
+	const file = join(dir, `${tag}-${asset.name}`.replace(/[^A-Za-z0-9._-]/g, "_"));
 	const id = `u${++downloadSeq}`;
 	const rec: UpdateDownload = { state: "downloading", received: 0, total: asset.size, tag };
 	downloads.set(id, rec);

@@ -194,6 +194,53 @@ class McpServer {
   List<Map<String, dynamic>> get tools => _l(json['tools']);
 }
 
+enum TaskStatus { todo, inProgress, done, blocked }
+
+/// One line of the agent's checklist (the `tasks` tool, agent/src/tasks.ts).
+class TaskItem {
+  const TaskItem({required this.id, required this.title, required this.status, this.note});
+
+  factory TaskItem.fromJson(Map<String, dynamic> j) => TaskItem(
+    id: j['id'] as String,
+    title: j['title'] as String,
+    status: switch (j['status']) {
+      'in_progress' => TaskStatus.inProgress,
+      'done' => TaskStatus.done,
+      'blocked' => TaskStatus.blocked,
+      _ => TaskStatus.todo,
+    },
+    note: j['note'] as String?,
+  );
+
+  final String id;
+  final String title;
+  final TaskStatus status;
+  final String? note;
+}
+
+/// The checklist of one chat at one point in its conversation.
+class TaskList {
+  const TaskList(this.sessionId, this.items);
+
+  factory TaskList.fromJson(Map<String, dynamic> j) => TaskList(
+    j['sessionId'] as String,
+    [for (final i in (j['items'] as List? ?? const [])) TaskItem.fromJson(_m(i))],
+  );
+
+  final String sessionId;
+  final List<TaskItem> items;
+
+  int get total => items.length;
+  int get done => items.where((i) => i.status == TaskStatus.done).length;
+  int get blocked => items.where((i) => i.status == TaskStatus.blocked).length;
+
+  /// Finished: something was written down and all of it is done.
+  bool get complete => items.isNotEmpty && done == total;
+
+  /// What the agent is working on now, if it said so.
+  TaskItem? get active => items.where((i) => i.status == TaskStatus.inProgress).firstOrNull;
+}
+
 class SlashCommand {
   SlashCommand(this.name, this.description, this.hint, {required this.isSkill});
   final String name;
@@ -230,6 +277,13 @@ class Features extends ChangeNotifier {
   int concurrency = 1;
   bool keepAlive = false;
   List<McpServer> mcpServers = const [];
+
+  // Checklists by chat, newest last. A few are kept so switching between chats is instant.
+  final _tasks = <String, TaskList>{};
+  static const _keepTaskLists = 20;
+
+  /// The checklist of the chat with this id, or null if the agent has not made one (or it is not loaded yet).
+  TaskList? tasksFor(String? sessionId) => sessionId == null ? null : _tasks[sessionId];
 
   /// Fired when the chat's run ends (for notifications): preview text.
   final done = StreamController<String>.broadcast();
@@ -270,7 +324,30 @@ class Features extends ChangeNotifier {
         notifyListeners();
       case 'agent_done':
         done.add(r['preview'] as String? ?? '');
+      case 'tasks':
+        _setTasks(TaskList.fromJson(r));
+        notifyListeners();
     }
+  }
+
+  void _setTasks(TaskList list) {
+    _tasks
+      ..remove(list.sessionId)
+      ..[list.sessionId] = list;
+    while (_tasks.length > _keepTaskLists) {
+      _tasks.remove(_tasks.keys.first);
+    }
+  }
+
+  /// Feeds a record in as if the host had sent it. For tests.
+  @visibleForTesting
+  void handleRecord(Map<String, dynamic> record) => _onRecord(record);
+
+  /// Asks the host for the open chat's checklist as of now. Call when the chat changes or the conversation was
+  /// rewound (editing a message, forking): the list follows the conversation.
+  Future<void> loadTasks() async {
+    _setTasks(TaskList.fromJson(_m(await client.call('tasks_get'))));
+    notifyListeners();
   }
 
   void _applyRuns(Map<String, dynamic> s) {
@@ -306,6 +383,16 @@ class Features extends ChangeNotifier {
     approvals.remove(a);
     notifyListeners();
     await client.call('approval_reply', {'approvalId': a.id, 'allow': allow, 'always': always, 'key': a.key});
+  }
+
+  /// Replaces the approvals shown with the ones the host is still waiting on. For after a reconnect, when
+  /// `approval` records may have been missed.
+  Future<void> refreshApprovals() async {
+    final pending = await client.call<List>('approvals_pending');
+    approvals
+      ..clear()
+      ..addAll(pending.map((e) => Approval(_m(e))));
+    notifyListeners();
   }
 
   // Conversation editing ------------------------------------------------------
@@ -455,13 +542,27 @@ class Features extends ChangeNotifier {
   }
 
   // Backups ---------------------------------------------------------------------
-  Future<({String path, int files})> backup({bool includeWorkspace = false}) async {
-    final r = _m(await client.call('backup_create', {'includeWorkspace': includeWorkspace}));
-    return (path: r['path'] as String, files: r['files'] as int);
+  /// What a backup would hold, before making it: files, bytes, and how many files are too big to go in.
+  Future<({int files, int bytes, int tooLarge})> backupEstimate({bool includeWorkspace = false}) async {
+    final r = _m(await client.call('backup_estimate', {'includeWorkspace': includeWorkspace}));
+    return (files: (r['files'] as num).toInt(), bytes: (r['bytes'] as num).toInt(), tooLarge: (r['tooLarge'] as num?)?.toInt() ?? 0);
   }
 
-  Future<int> restoreBackup(String path) async =>
-      _m(await client.call('backup_restore', {'path': path}))['restored'] as int;
+  /// Makes a backup on the agent's machine. [left] counts the files that could not go in (too big, or links).
+  Future<({String path, int files, int bytes, int left})> backup({bool includeWorkspace = false}) async {
+    final r = _m(await client.call('backup_create', {'includeWorkspace': includeWorkspace}));
+    return (path: r['path'] as String, files: (r['files'] as num).toInt(), bytes: (r['bytes'] as num?)?.toInt() ?? 0, left: (r['leftCount'] as num?)?.toInt() ?? 0);
+  }
+
+  /// Puts a backup back. [skipped] says which entries could not be restored and why.
+  Future<({int restored, List<String> skipped, int skippedCount})> restoreBackup(String path) async {
+    final r = _m(await client.call('backup_restore', {'path': path}));
+    return (
+      restored: (r['restored'] as num).toInt(),
+      skipped: [for (final e in (r['skipped'] as List? ?? const [])) '${(e as Map)['name']}: ${e['reason']}'],
+      skippedCount: (r['skippedCount'] as num?)?.toInt() ?? 0,
+    );
+  }
 
   @override
   void dispose() {

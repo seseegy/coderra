@@ -52,6 +52,7 @@ app.*.map.json
 /android/app/src/main/assets/agent.zip
 /android/app/src/main/assets/agent.stamp
 /agent/node_modules/
+/agent/.test-out/
 __pycache__/
 
 # JVM crash logs

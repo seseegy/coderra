@@ -1,5 +1,5 @@
+import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
@@ -7,8 +7,11 @@ import 'package:flutter/services.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:markdown/markdown.dart' as md;
 
+import '../agent/agent_controller.dart';
+import '../agent/agent_fs.dart';
 import '../agent/models.dart';
 import 'code_view.dart';
+import 'preview_open.dart';
 import 'preview_screen.dart';
 import 'kit.dart';
 import 'theme.dart';
@@ -51,15 +54,21 @@ class UserMessageView extends StatelessWidget {
 }
 
 class AssistantMessageView extends StatelessWidget {
-  const AssistantMessageView(this.entry, {super.key, required this.tools, this.cwd, this.live});
+  const AssistantMessageView(this.entry, {super.key, required this.tools, this.cwd, this.live, this.fs = const LocalFs(), this.agent});
   final AssistantEntry entry;
   final Map<String, ToolRun> tools;
 
   /// Where relative tool paths resolve, for previews.
   final String? cwd;
 
+  /// Reads the files the agent wrote, for previews.
+  final AgentFs fs;
+
   /// Fires as the agent streams; live previews re-render on it.
   final Listenable? live;
+
+  /// Needed to open a page that lives on a server.
+  final AgentController? agent;
 
   @override
   Widget build(BuildContext context) {
@@ -77,7 +86,7 @@ class AssistantMessageView extends StatelessWidget {
             children.add(ThinkingView(text: b.text, live: entry.streaming && identical(b, blocks.last)));
           }
         case BlockKind.toolCall:
-          children.add(ToolCallView(block: b, run: tools[b.toolCallId], cwd: cwd, live: live));
+          children.add(ToolCallView(block: b, run: tools[b.toolCallId], cwd: cwd, live: live, fs: fs, agent: agent));
       }
     }
     if (entry.streaming && children.isEmpty) children.add(const _Pending());
@@ -358,11 +367,13 @@ class _ThinkingViewState extends State<ThinkingView> {
 }
 
 class ToolCallView extends StatefulWidget {
-  const ToolCallView({super.key, required this.block, required this.run, this.cwd, this.live});
+  const ToolCallView({super.key, required this.block, required this.run, this.cwd, this.live, this.fs = const LocalFs(), this.agent});
   final Block block;
   final ToolRun? run;
   final String? cwd;
   final Listenable? live;
+  final AgentController? agent;
+  final AgentFs fs;
 
   @override
   State<ToolCallView> createState() => _ToolCallViewState();
@@ -384,25 +395,31 @@ class _ToolCallViewState extends State<ToolCallView> {
 
   /// The page as it stands: the file on disk once written, else the content
   /// streamed so far.
-  String _htmlSource() {
+  FutureOr<String> _htmlSource() {
     final args = widget.block.liveArgs;
     final file = _absolute(args?['path'] as String?);
+    final streamed = args?['content'] as String? ?? '';
     if (widget.block.args != null && file != null) {
-      try {
-        final f = File(file);
-        if (f.existsSync()) return f.readAsStringSync();
-      } catch (_) {}
+      // The finished file; the streamed content stands in until it exists.
+      return widget.fs.readString(file).catchError((_) => streamed);
     }
-    return args?['content'] as String? ?? '';
+    return streamed;
   }
 
   void _preview(String path, {required bool writing}) {
     final file = _absolute(path);
+    final agent = widget.agent;
+    final title = path.split('/').last;
+    // A finished page that lives on a server is opened from the server; anything else is shown from its text.
+    if (agent != null && file != null && !widget.fs.isLocal && !writing) {
+      openFilePreview(context, agent, title: title, path: file, source: _htmlSource);
+      return;
+    }
     HtmlPreviewScreen.open(
       context,
-      title: path.split('/').last,
+      title: title,
       source: _htmlSource,
-      baseDir: file == null ? null : File(file).parent.path,
+      baseDir: file == null || !widget.fs.isLocal ? null : parentPath(file),
       // Re-render as it streams; a finished file is static.
       live: writing ? widget.live : null,
     );

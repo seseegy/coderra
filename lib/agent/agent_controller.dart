@@ -3,9 +3,11 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 
 import 'agent_client.dart';
+import 'agent_fs.dart';
 import 'features.dart';
 import 'integrations.dart';
 import 'models.dart';
+import 'remote_mode.dart';
 
 enum BootStatus { starting, ready, failed }
 
@@ -20,6 +22,12 @@ class AgentController extends ChangeNotifier {
   late final integrations = Integrations(client);
   late final features = Features(client);
 
+  /// Whether the agent runs on this phone or on a server, and the server's setup.
+  late final remote = RemoteMode(this);
+
+  /// The files on the machine the agent works on. Screens go through this instead of `dart:io`.
+  AgentFs fs = const LocalFs();
+
   BootStatus status = BootStatus.starting;
   String? bootError;
   Map<String, dynamic> info = const {};
@@ -33,6 +41,9 @@ class AgentController extends ChangeNotifier {
   String? sessionFile;
   String cwd = '';
   bool busy = false;
+
+  /// The chat stops in the middle of something and nothing is running (the host was cut off while it worked).
+  bool interrupted = false;
 
   /// Set when the current model is billed differently than the user may expect.
   String? billingNotice;
@@ -108,6 +119,7 @@ class AgentController extends ChangeNotifier {
     _applyState(await client.call<Map<String, dynamic>>('new_session', {'cwd': ?dir}));
     _resetTranscript();
     notifyListeners();
+    _loadTasks();
   }
 
   Future<void> openSession(String path) async {
@@ -137,7 +149,27 @@ class AgentController extends ChangeNotifier {
       _addMessage(m.cast<String, dynamic>(), fromHistory: true);
     }
     notifyListeners();
+    _loadTasks();
   }
+
+  /// Reads everything the app mirrors from the host again, after a stretch of records was lost.
+  Future<void> resync() async {
+    try {
+      _applyState(await client.call<Map<String, dynamic>>('state'));
+      _streaming = null;
+      await loadHistory();
+      notifyListeners();
+      await Future.wait([
+        features.refreshApprovals().catchError((_) {}),
+        features.refreshRuns().catchError((_) {}),
+      ]);
+    } catch (_) {
+      // Dropped again before it finished: the next reconnect asks again.
+    }
+  }
+
+  /// The checklist follows the conversation, so it is read again whenever the transcript is (re)loaded.
+  void _loadTasks() => features.loadTasks().catchError((_) {});
 
   // -------------------------------------------------------------------------
   // Models & providers
@@ -295,7 +327,13 @@ class AgentController extends ChangeNotifier {
         notifyListeners();
       case 'error':
         _addNotice(readableError(record['message'] as String? ?? 'Error'), error: true);
+      // The link to a server agent was missed in part: what the host kept does not reach back far enough, or it was
+      // restarted. Read the state again instead of trusting the transcript.
+      case 'resync':
+        unawaited(resync());
       case 'exit':
+        // With a server agent the client reconnects by itself; the connection indicator shows it, not a failure screen.
+        if (client.isRemote) break;
         if (status == BootStatus.ready) {
           status = BootStatus.failed;
           bootError = 'The agent process stopped (code ${record['code']}).\n\n${client.stderrTail.join('\n')}';
@@ -439,6 +477,18 @@ class AgentController extends ChangeNotifier {
     planMode = s['planMode'] == true;
     approvalMode = s['approvalMode'] as String? ?? approvalMode;
     if (s['isStreaming'] is bool) _setBusy(s['isStreaming'] as bool);
+    interrupted = s['interrupted'] == true;
+  }
+
+  /// Tells the agent to carry on after the host was cut off.
+  Future<void> continueSession() async {
+    interrupted = false;
+    notifyListeners();
+    try {
+      await client.call('continue_session');
+    } on AgentError catch (e) {
+      _addNotice(e.message, error: true);
+    }
   }
 
   /// Re-reads session state after something outside the chat changed it (the shell).

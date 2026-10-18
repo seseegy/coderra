@@ -149,7 +149,62 @@ object AgentRuntime {
             putAll(env)
             putAll(extraEnv)
         }
+        launch(pb)
+    }
 
+    /**
+     * Connects to an agent running on a server instead of starting one here: [argv] is the command the app built
+     * (ssh, with its config, running coderra-attach on the server), and its stdin/stdout are the same JSON lines the
+     * local host speaks, so everything above this is unchanged.
+     *
+     * The phone's store key (ANDROPI_STORE_KEY) is deliberately not part of this environment: it unlocks the
+     * encrypted tokens of the agent on this phone and has no business on a server's connection.
+     */
+    @Synchronized
+    fun startRemote(context: Context, argv: List<String>, extraEnv: Map<String, String> = emptyMap()) {
+        if (isRunning) return
+        require(argv.isNotEmpty()) { "no command to run" }
+        // Preparing the environment is also what links ssh and rsync into bin/, so it comes before looking for them.
+        val env = prepareEnvironment(context)
+        require(File(argv[0]).canExecute()) { "${argv[0]} cannot be run" }
+        val p = paths(context)
+        val pb = ProcessBuilder(argv).directory(File(p.getValue("home")))
+        pb.environment().apply {
+            putAll(env)
+            putAll(extraEnv)
+            remove("ANDROPI_STORE_KEY")
+        }
+        launch(pb)
+    }
+
+    /** The running build, for update checks: the version name and the CI run number. */
+    fun appInfo(context: Context): Map<String, Any> = mapOf(
+        "version" to appVersionName(context),
+        "build" to appBuildNumber(context),
+        "abi" to appAbi(context),
+    )
+
+    /**
+     * Which of the release's APKs this install is. Flutter's split-per-abi adds 1000 (armeabi-v7a), 2000 (arm64-v8a) or
+     * 4000 (x86_64) to versionCode; a build that is not split falls back on the phone's preferred CPU.
+     */
+    private fun appAbi(context: Context): String {
+        try {
+            val info = context.packageManager.getPackageInfo(context.packageName, 0)
+            val code = if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode
+            else @Suppress("DEPRECATION") info.versionCode.toLong()
+            when (code / 1000) {
+                1L -> return "armeabi-v7a"
+                2L -> return "arm64-v8a"
+                4L -> return "x86_64"
+            }
+        } catch (_: Exception) {
+        }
+        return android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: ""
+    }
+
+    /** Starts the process and wires its output, errors and exit to the listener. */
+    private fun launch(pb: ProcessBuilder) {
         val proc = pb.start()
         process = proc
         stdin = proc.outputStream

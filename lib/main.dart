@@ -5,12 +5,15 @@ import 'agent/agent_controller.dart';
 import 'ui/app_lock.dart';
 import 'ui/home_shell.dart';
 import 'ui/onboarding.dart';
+import 'ui/server_screen.dart';
 import 'ui/kit.dart';
 import 'ui/theme.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  final agent = AgentController(AgentClient())..boot();
+  final agent = AgentController(AgentClient());
+  // Which agent to use (this phone's or the server's) is decided before the first connection.
+  agent.remote.load().whenComplete(agent.boot);
   runApp(AndroPiApp(agent: agent));
 }
 
@@ -113,6 +116,16 @@ class _BootFailed extends StatelessWidget {
               ),
               const SizedBox(height: 16),
               FilledButton(onPressed: agent.boot, child: const Text('Try again')),
+              // A server that cannot be reached must not lock the user out of the agent on the phone.
+              if (agent.client.isRemote) ...[
+                const SizedBox(height: 8),
+                OutlinedButton(onPressed: () => agent.remote.use(false), child: const Text('Use the agent on this phone instead')),
+                const SizedBox(height: 8),
+                TextButton(
+                  onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => ServerScreen(agent: agent))),
+                  child: const Text('Server settings'),
+                ),
+              ],
             ],
           ),
         ),

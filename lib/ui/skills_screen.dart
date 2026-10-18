@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
@@ -118,7 +117,7 @@ class _SkillsScreenState extends State<SkillsScreen> {
   }
 
   Future<void> _open(SkillInfo s) async {
-    final body = await File('${s.path}/SKILL.md').readAsString().catchError((_) => '');
+    final body = await widget.agent.fs.readString('${s.path}/SKILL.md').catchError((_) => '');
     if (!mounted) return;
     final remove = await showModalBottomSheet<bool>(
       context: context,

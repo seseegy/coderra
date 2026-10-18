@@ -1,32 +1,46 @@
 /**
- * Background agent runs: a queue (with a concurrency limit, so several agents
- * can work at once), scheduled tasks, and GitHub issue triggers. Each run is
- * its own pi session, so the result can be opened later as a normal chat.
+ * Background agent runs: a queue (with a concurrency limit, so several agents can work at once), scheduled tasks, and
+ * GitHub issue triggers. Each run is its own pi session, so the result can be opened later as a normal chat.
+ *
+ * A run is either a single prompt, or a long task: a job the agent is kept at, round after round, until it is done,
+ * stuck or out of allowance (longtask.ts). If the process dies while a run is going, the run is picked up again from its
+ * session file when the host starts, a few times, instead of being lost.
  */
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { LongTaskError, type LongTask, normalizeTask, RESUME_PROMPT, superviseTask, type TaskSession } from "./longtask.js";
 
-export interface RunSession {
+export interface RunSession extends TaskSession {
 	sessionFile?: string;
-	prompt(text: string): Promise<void>;
-	lastText(): string | undefined;
-	errorText(): string | undefined;
 	abort(): Promise<void>;
 	dispose(): void;
 }
+
+export type RunStatus = "queued" | "running" | "done" | "error" | "cancelled" | "blocked" | "limit";
 
 export interface Run {
 	id: string;
 	title: string;
 	prompt: string;
 	cwd: string;
-	status: "queued" | "running" | "done" | "error" | "cancelled";
+	status: RunStatus;
 	source: "queue" | "schedule" | "trigger";
 	createdAt: number;
 	startedAt?: number;
 	finishedAt?: number;
 	sessionFile?: string;
 	summary?: string;
+	/** Why it ended, or what happened to it on the way (resumed after a restart). */
+	reason?: string;
+	/** Present for a long task. */
+	task?: LongTask;
+	/** Rounds done and money spent so far, for a long task. */
+	iteration?: number;
+	cost?: number;
+	/** How many times it was picked up again after the host restarted. */
+	resumes?: number;
+	/** Set while it waits to be picked up again: the next start continues the old session. */
+	resume?: boolean;
 }
 
 export interface Schedule {
@@ -49,26 +63,73 @@ interface Store {
 	concurrency: number;
 }
 
+export interface RunnerOptions {
+	/** A restart picks a run up again at most this many times. */
+	maxResumes?: number;
+	/** Called before every round of a long task; a throw ends the task (disk full, daily budget). */
+	preflight?: () => Promise<void> | void;
+}
+
+const CLOCK_MS = 60_000;
+
 export class Runner {
 	private store: Store = { runs: [], schedules: [], concurrency: 1 };
 	private active = new Map<string, RunSession>();
+	/** Runs the user asked to stop; the loop of a long task looks here between rounds. */
+	private stopping = new Set<string>();
 	private timer?: NodeJS.Timeout;
+	private first?: NodeJS.Timeout;
+	private readonly maxResumes: number;
 
 	constructor(
 		private readonly file: string,
-		private readonly makeSession: (cwd: string) => Promise<RunSession>,
+		private readonly makeSession: (cwd: string, sessionFile?: string) => Promise<RunSession>,
 		private readonly notify: (record: object) => void,
 		private readonly github: (path: string) => Promise<any>,
+		private readonly options: RunnerOptions = {},
 	) {
+		this.maxResumes = options.maxResumes ?? 3;
 		if (existsSync(file)) {
 			try {
 				this.store = { runs: [], schedules: [], concurrency: 1, ...JSON.parse(readFileSync(file, "utf8")) };
 			} catch {}
 		}
-		// Runs interrupted by an app restart cannot resume.
-		for (const r of this.store.runs) if (r.status === "running") r.status = "error";
-		this.timer = setInterval(() => void this.tick(), 60_000);
-		setTimeout(() => void this.tick(), 5_000);
+		const resumed = this.recoverInterrupted();
+		this.timer = setInterval(() => void this.tick(), CLOCK_MS);
+		this.timer.unref();
+		this.first = setTimeout(() => void this.tick(), 5_000);
+		this.first.unref();
+		if (resumed > 0) {
+			this.notify({ type: "notice", message: `Picking up ${resumed} background ${resumed === 1 ? "task" : "tasks"} again after the host restarted.` });
+		}
+		// Let whoever built the runner finish setting up before the first run starts.
+		setTimeout(() => this.pump(), 0).unref();
+	}
+
+	/**
+	 * A run that was going when the process died cannot continue in memory, but its conversation is on disk. Put it back
+	 * in the queue to continue from there, unless it has already been through this too many times.
+	 */
+	private recoverInterrupted(): number {
+		let resumed = 0;
+		for (const r of this.store.runs) {
+			if (r.status !== "running") continue;
+			const n = (r.resumes ?? 0) + 1;
+			if (n > this.maxResumes) {
+				r.status = "error";
+				r.reason = `The host restarted ${this.maxResumes} times while this was running; giving up.`;
+				r.summary = r.reason;
+				r.finishedAt = Date.now();
+				continue;
+			}
+			r.status = "queued";
+			r.resumes = n;
+			r.resume = !!r.sessionFile;
+			r.reason = `Picked up again after a restart (${n} of ${this.maxResumes}).`;
+			resumed++;
+		}
+		if (this.store.runs.length) this.save();
+		return resumed;
 	}
 
 	private save() {
@@ -81,14 +142,19 @@ export class Runner {
 			runs: this.store.runs,
 			schedules: this.store.schedules,
 			concurrency: this.store.concurrency,
-			running: this.active.size,
+			running: this.runningCount(),
 			keepAlive: this.keepAlive(),
 		};
 	}
 
 	/** Whether the app should stay alive in the background (runs or schedules pending). */
 	keepAlive() {
-		return this.active.size > 0 || this.store.runs.some((r) => r.status === "queued") || this.store.schedules.some((s) => s.enabled);
+		return this.runningCount() > 0 || this.store.runs.some((r) => r.status === "queued") || this.store.schedules.some((s) => s.enabled);
+	}
+
+	/** Long tasks that are going right now, for progress reports. */
+	runningTasks(): Run[] {
+		return this.store.runs.filter((r) => r.status === "running" && r.task);
 	}
 
 	private changed() {
@@ -102,7 +168,17 @@ export class Runner {
 		this.pump();
 	}
 
-	enqueue(prompt: string, cwd: string, title?: string, source: Run["source"] = "queue") {
+	/** Adds a run to the queue. With `task`, it is a long task and `task` is checked and completed (throws if it makes no sense). */
+	enqueue(prompt: string, cwd: string, title?: string, source: Run["source"] = "queue", task?: unknown) {
+		let spec: LongTask | undefined;
+		if (task !== undefined && task !== null) {
+			try {
+				spec = normalizeTask(task);
+			} catch (e) {
+				if (e instanceof LongTaskError) throw new Error(e.message);
+				throw e;
+			}
+		}
 		const run: Run = {
 			id: `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
 			title: title || prompt.split("\n")[0].slice(0, 80),
@@ -111,6 +187,7 @@ export class Runner {
 			status: "queued",
 			source,
 			createdAt: Date.now(),
+			...(spec ? { task: spec, iteration: 0, cost: 0 } : {}),
 		};
 		this.store.runs.unshift(run);
 		this.changed();
@@ -121,8 +198,15 @@ export class Runner {
 	async cancel(id: string) {
 		const run = this.store.runs.find((r) => r.id === id);
 		if (!run) return;
-		if (run.status === "running") await this.active.get(id)?.abort();
-		if (run.status === "queued" || run.status === "running") run.status = "cancelled";
+		if (run.status === "running") {
+			// Say so first: a long task checks this between rounds, and the abort below makes the round in progress end.
+			this.stopping.add(id);
+			await this.active.get(id)?.abort();
+		}
+		if (run.status === "queued" || run.status === "running") {
+			run.status = "cancelled";
+			run.finishedAt ??= Date.now();
+		}
 		this.changed();
 	}
 
@@ -131,8 +215,13 @@ export class Runner {
 		this.changed();
 	}
 
+	/** Runs that have begun, counted by status: a run is "running" from the moment it starts, before its session exists. */
+	private runningCount() {
+		return this.store.runs.filter((r) => r.status === "running").length;
+	}
+
 	private pump() {
-		while (this.active.size < this.store.concurrency) {
+		while (this.runningCount() < this.store.concurrency) {
 			const next = [...this.store.runs].reverse().find((r) => r.status === "queued");
 			if (!next) return;
 			void this.start(next);
@@ -140,20 +229,19 @@ export class Runner {
 	}
 
 	private async start(run: Run) {
+		const resumed = !!run.resume;
+		run.resume = false;
 		run.status = "running";
-		run.startedAt = Date.now();
+		run.startedAt ??= Date.now();
 		this.changed();
 		let session: RunSession | undefined;
 		try {
-			session = await this.makeSession(run.cwd);
+			session = await this.makeSession(run.cwd, resumed ? run.sessionFile : undefined);
 			this.active.set(run.id, session);
 			run.sessionFile = session.sessionFile;
 			this.changed();
-			await session.prompt(run.prompt);
-			const err = session.errorText();
-			if ((run.status as string) === "cancelled") return;
-			run.status = err ? "error" : "done";
-			run.summary = (err ?? session.lastText() ?? "").slice(0, 600);
+			if (run.task) await this.superviseRun(run, session, resumed);
+			else await this.single(run, session, resumed);
 		} catch (e) {
 			if ((run.status as string) !== "cancelled") {
 				run.status = "error";
@@ -162,11 +250,44 @@ export class Runner {
 		} finally {
 			run.finishedAt = Date.now();
 			this.active.delete(run.id);
+			this.stopping.delete(run.id);
 			session?.dispose();
 			this.changed();
 			this.notify({ type: "run_finished", run });
 			this.pump();
 		}
+	}
+
+	private async single(run: Run, session: RunSession, resumed: boolean) {
+		await session.prompt(resumed ? RESUME_PROMPT : run.prompt);
+		const err = session.errorText();
+		if ((run.status as string) === "cancelled") return;
+		run.status = err ? "error" : "done";
+		run.summary = (err ?? session.lastText() ?? "").slice(0, 600);
+	}
+
+	private async superviseRun(run: Run, session: RunSession, resumed: boolean) {
+		const outcome = await superviseTask({
+			session,
+			prompt: run.prompt,
+			task: run.task!,
+			iteration: run.iteration ?? 0,
+			resumed,
+			startedAt: run.startedAt!,
+			shouldStop: () => this.stopping.has(run.id),
+			preflight: this.options.preflight,
+			onRound: ({ iteration, cost }) => {
+				run.iteration = iteration;
+				run.cost = cost;
+				this.changed();
+			},
+		});
+		run.iteration = outcome.iterations;
+		run.cost = outcome.cost;
+		if ((run.status as string) === "cancelled") return;
+		run.status = outcome.status;
+		run.reason = outcome.reason;
+		run.summary = [outcome.reason, session.lastText()].filter(Boolean).join("\n\n").slice(0, 600);
 	}
 
 	// -------------------------------------------------------------------------
@@ -260,5 +381,6 @@ export class Runner {
 
 	dispose() {
 		if (this.timer) clearInterval(this.timer);
+		if (this.first) clearTimeout(this.first);
 	}
 }
