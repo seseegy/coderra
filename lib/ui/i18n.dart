@@ -36,6 +36,7 @@ const _id = <String, String>{
   'Cancel': 'Batal',
   'Save': 'Simpan',
   'Tasks': 'Tugas',
+  'Checklist': 'Daftar tugas',
   'Build a web app': 'Bikin web app',
   'Chat with the smartest agent': 'Ngobrol sama agent terpintar',
   'Clone a GitHub repo': 'Clone repo GitHub',

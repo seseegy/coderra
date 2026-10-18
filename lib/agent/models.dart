@@ -200,10 +200,40 @@ String toolSummary(String? name, Map<String, dynamic>? args) {
     ),
     'read' || 'write' || 'edit' || 'ls' => _shortPath(pick(['path', 'file_path'])),
     'grep' => pick(['pattern']),
+    'tasks' => _tasksSummary(args),
+    'subagent' => _subagentSummary(args),
     'find' => pick(['pattern', 'path']),
     _ => null,
   };
   return (value ?? jsonEncode(args)).split('\n').first;
+}
+
+/// `explorer: Find login`: which kind of helper was started and for what.
+String? _subagentSummary(Map<String, dynamic> args) {
+  final role = args['role'] is String && (args['role'] as String).isNotEmpty ? args['role'] as String : 'explorer';
+  final what = (args['title'] is String && (args['title'] as String).trim().isNotEmpty ? args['title'] : args['task']);
+  if (what is! String || what.trim().isEmpty) return null;
+  return '$role: ${what.trim()}';
+}
+
+/// `set 4 tasks`, `t2 → done`: what a `tasks` call does, for the collapsed tool card.
+String? _tasksSummary(Map<String, dynamic> args) {
+  final action = args['action'];
+  if (action is! String || action.isEmpty) return null;
+  final items = args['items'];
+  final id = args['id'];
+  final text = switch (action) {
+    'set' => items is List ? 'set ${items.length} ${items.length == 1 ? 'task' : 'tasks'}' : 'set',
+    'add' => items is List ? 'add ${items.length} ${items.length == 1 ? 'task' : 'tasks'}' : 'add ${args['title'] ?? ''}',
+    'update' => [
+      if (id is String) id,
+      if (args['status'] is String) '→ ${args['status']}',
+      if (args['title'] is String) 'renamed',
+    ].join(' '),
+    'remove' => 'remove ${id is String ? id : ''}',
+    _ => action,
+  }.trim();
+  return text.isEmpty ? null : text;
 }
 
 /// Full paths on the phone are long and say little; the file name is what matters. Generic names

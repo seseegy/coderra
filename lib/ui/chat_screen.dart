@@ -20,7 +20,9 @@ import 'tasks_screen.dart';
 import 'terminal_screen.dart';
 import 'settings_screen.dart';
 import 'folder_picker.dart';
+import 'server_screen.dart';
 import 'theme.dart';
+import 'transfer_dialog.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({
@@ -161,7 +163,21 @@ class _ChatScreenState extends State<ChatScreen> {
     if (files.isEmpty) {
       await agent.send(text);
     } else {
-      final prompt = await preparePrompt(text, files, agent.cwd);
+      // Files go to the server first when the agent is there; that can take a while, and it can fail.
+      final prompt = await runTransfer(
+        context,
+        title: tr('Sending files'),
+        show: !agent.fs.isLocal,
+        task: (h) => preparePrompt(text, files, agent.cwd, agent.fs, onProgress: h.onProgress, cancel: h.cancel, onFile: (l) => h.label = l),
+      );
+      if (prompt == null) {
+        // Nothing was sent: the message and its files are back where they were, to try again.
+        if (mounted) {
+          input.text = text;
+          setState(() => attachments.addAll(files));
+        }
+        return;
+      }
       await agent.sendWith(prompt.text, images: prompt.images);
     }
   }
@@ -283,6 +299,7 @@ class _ChatScreenState extends State<ChatScreen> {
               : null,
           title: _Title(agent: agent),
           actions: [
+            ConnectionChip(agent: agent),
             IconButton(
               tooltip: tr('Terminal'),
               icon: const Icon(LucideIcons.squareTerminal, size: 20),
@@ -304,6 +321,7 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
         body: Column(
           children: [
+            ConnectionBanner(agent: agent),
             Expanded(
               child: Stack(
                 children: [
@@ -355,7 +373,9 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
             DevServerBanner(agent: agent),
             ApprovalCards(features: agent.features),
+            InterruptedBar(agent: agent),
             PlanBar(agent: agent),
+            ChecklistCard(agent: agent),
             if (_slashQuery != null && slash != null)
               SlashMenu(commands: slash!, query: _slashQuery!, onPick: (c) => _prefill('/${c.name} ')),
             if (agent.billingNotice != null)
@@ -397,7 +417,7 @@ class _ChatScreenState extends State<ChatScreen> {
             e,
             onLongPress: () => _userMenu(e, entries.take(i).whereType<UserEntry>().length),
           ),
-          AssistantEntry() => AssistantMessageView(e, tools: agent.tools, cwd: agent.cwd, live: agent),
+          AssistantEntry() => AssistantMessageView(e, tools: agent.tools, cwd: agent.cwd, live: agent, fs: agent.fs, agent: agent),
           NoticeEntry() => NoticeView(e),
         };
         final gap = i == 0 ? 0.0 : (e is UserEntry ? 28.0 : 14.0);

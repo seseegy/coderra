@@ -8,6 +8,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../agent/agent_controller.dart';
+import '../agent/agent_fs.dart';
 import '../agent/features.dart';
 import 'i18n.dart';
 import 'changes_screen.dart';
@@ -15,7 +16,7 @@ import 'editor_screen.dart';
 import 'files_screen.dart';
 import 'git_screen.dart';
 import 'kit.dart';
-import 'preview_screen.dart';
+import 'preview_open.dart';
 import 'search_screen.dart';
 import 'tasks_screen.dart';
 import 'theme.dart';
@@ -46,22 +47,34 @@ class Attachment {
 
 /// Pictures go to the model as images; other files are copied into the
 /// project's `.attachments/` folder and referenced by path in the message.
+/// The attachments live on the phone ([Attachment.path]); the project folder is on the agent's machine ([fs]).
 Future<({String text, List<Map<String, String>> images})> preparePrompt(
   String text,
   List<Attachment> attachments,
   String cwd,
-) async {
+  AgentFs fs, {
+  Progress? onProgress,
+  CancelToken? cancel,
+  void Function(String label)? onFile,
+}) async {
   final images = <Map<String, String>>[];
   final paths = <String>[];
+  final toCopy = [
+    for (final a in attachments)
+      if (File(a.path).existsSync() && !(a.isImage && File(a.path).lengthSync() < 8 * 1024 * 1024)) a,
+  ];
   for (final a in attachments) {
     final file = File(a.path);
     if (!file.existsSync()) continue;
     if (a.isImage && file.lengthSync() < 8 * 1024 * 1024) {
       images.add({'type': 'image', 'data': base64Encode(await file.readAsBytes()), 'mimeType': a.imageMime!});
     } else {
-      final dir = Directory('$cwd/.attachments')..createSync(recursive: true);
-      final target = '${dir.path}/${a.name}';
-      await file.copy(target);
+      cancel?.check();
+      onFile?.call(toCopy.length > 1 ? '${a.name} · ${toCopy.indexOf(a) + 1} ${tr('of')} ${toCopy.length}' : a.name);
+      final dir = '$cwd/.attachments';
+      await fs.mkdir(dir);
+      final target = '$dir/${a.name}';
+      await fs.upload(a.path, target, onProgress: onProgress, cancel: cancel);
       paths.add(target);
     }
   }
@@ -350,12 +363,156 @@ class PlanBar extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
+// Checklist
+
+/// The agent's checklist for this chat (the `tasks` tool): how far it is, what it is on now, and every task when opened.
+class ChecklistCard extends StatefulWidget {
+  const ChecklistCard({super.key, required this.agent});
+  final AgentController agent;
+
+  @override
+  State<ChecklistCard> createState() => _ChecklistCardState();
+}
+
+class _ChecklistCardState extends State<ChecklistCard> {
+  bool open = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final agent = widget.agent;
+    final p = context.palette;
+    return ListenableBuilder(
+      listenable: Listenable.merge([agent, agent.features]),
+      builder: (context, _) {
+        final list = agent.features.tasksFor(agent.sessionId);
+        if (list == null || list.items.isEmpty) return const SizedBox.shrink();
+        final active = list.active;
+        final blocked = list.blocked;
+        final tint = list.complete ? p.success : (blocked > 0 ? p.warning : p.accent);
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+          child: Container(
+            decoration: BoxDecoration(color: p.surface, borderRadius: BorderRadius.circular(18)),
+            clipBehavior: Clip.antiAlias,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                InkWell(
+                  onTap: () => setState(() => open = !open),
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(14, 10, 10, 8),
+                    child: Row(
+                      children: [
+                        Icon(list.complete ? LucideIcons.circleCheck : LucideIcons.listChecks, size: 18, color: tint),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(tr('Checklist'), style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13.5)),
+                              if (!open && active != null)
+                                Text(
+                                  active.title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(fontSize: 12, color: p.muted),
+                                ),
+                            ],
+                          ),
+                        ),
+                        Pill('${list.done}/${list.total}', color: tint),
+                        const SizedBox(width: 4),
+                        Icon(open ? LucideIcons.chevronUp : LucideIcons.chevronDown, size: 18, color: p.muted),
+                      ],
+                    ),
+                  ),
+                ),
+                LinearProgressIndicator(
+                  value: list.done / list.total,
+                  minHeight: 3,
+                  color: tint,
+                  backgroundColor: p.border,
+                ),
+                if (open)
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 240),
+                    child: ListView(
+                      shrinkWrap: true,
+                      padding: const EdgeInsets.fromLTRB(14, 8, 14, 10),
+                      children: [for (final item in list.items) _TaskRow(item, working: agent.busy)],
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _TaskRow extends StatelessWidget {
+  const _TaskRow(this.item, {required this.working});
+  final TaskItem item;
+
+  /// The agent is running right now, so the task it is on shows as busy rather than just marked.
+  final bool working;
+
+  @override
+  Widget build(BuildContext context) {
+    final p = context.palette;
+    final done = item.status == TaskStatus.done;
+    final icon = switch (item.status) {
+      TaskStatus.done => Icon(LucideIcons.circleCheck, size: 16, color: p.success),
+      TaskStatus.inProgress =>
+        working
+            ? SizedBox.square(dimension: 14, child: CircularProgressIndicator(strokeWidth: 2, color: p.accent))
+            : Icon(LucideIcons.circleDot, size: 16, color: p.accent),
+      TaskStatus.blocked => Icon(LucideIcons.triangleAlert, size: 16, color: p.warning),
+      TaskStatus.todo => Icon(LucideIcons.circle, size: 16, color: p.faint),
+    };
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(padding: const EdgeInsets.only(top: 2), child: SizedBox.square(dimension: 16, child: Center(child: icon))),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  item.title,
+                  style: TextStyle(
+                    fontSize: 13.5,
+                    height: 1.3,
+                    color: done ? p.muted : p.text,
+                    decoration: done ? TextDecoration.lineThrough : null,
+                    decorationColor: p.faint,
+                  ),
+                ),
+                if (item.note != null)
+                  Text(item.note!, style: TextStyle(fontSize: 12, height: 1.3, color: item.status == TaskStatus.blocked ? p.warning : p.muted)),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Dev servers
 
 /// A server the agent started: preview it, or share a public link.
 class DevServerBanner extends StatefulWidget {
-  const DevServerBanner({super.key, required this.agent});
+  const DevServerBanner({super.key, required this.agent, this.opener});
   final AgentController agent;
+
+  /// How a preview is shown; tests replace it (there is no WebView in a unit test).
+  final UrlOpener? opener;
 
   @override
   State<DevServerBanner> createState() => _DevServerBannerState();
@@ -421,7 +578,7 @@ class _DevServerBannerState extends State<DevServerBanner> {
                         ),
                       ),
                       TextButton(
-                        onPressed: () => HtmlPreviewScreen.openUrl(context, title: 'localhost:${e.key}', url: e.value),
+                        onPressed: () => openDevServer(context, widget.agent, e.key, e.value, opener: widget.opener),
                         child: Text(tr('Preview')),
                       ),
                       opening.contains(e.key)
@@ -561,12 +718,21 @@ Future<void> showProjectTools(
                     color: const Color(0xFFEC4899),
                     title: tr('Project memory'),
                     subtitle: tr('AGENTS.md: rules pi follows in this folder'),
-                    onTap: () {
-                      final f = File(memory);
-                      if (!f.existsSync()) {
-                        f.writeAsStringSync('# Project notes for pi\n\n- Stack:\n- How to run:\n- Conventions:\n');
+                    onTap: () async {
+                      try {
+                        if (!await agent.fs.exists(memory)) {
+                          await agent.fs.writeString(
+                            memory,
+                            '# Project notes for pi\n\n- Stack:\n- How to run:\n- Conventions:\n',
+                          );
+                        }
+                      } catch (e) {
+                        if (sheet.mounted) {
+                          ScaffoldMessenger.of(sheet).showSnackBar(SnackBar(content: Text('Could not create it: $e')));
+                        }
+                        return;
                       }
-                      go(EditorScreen(agent: agent, path: memory));
+                      if (sheet.mounted) go(EditorScreen(agent: agent, path: memory));
                     },
                   ),
                 ],

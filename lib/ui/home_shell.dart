@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -98,7 +97,11 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
   }
 
   @override
-  void didChangeAppLifecycleState(AppLifecycleState state) => lifecycle = state;
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    lifecycle = state;
+    // The server answers its pings with this, and pushes a notification instead when the app is in the background.
+    widget.agent.client.inBackground = _inBackground;
+  }
 
   /// Approvals that arrive while the app is in the background become notifications.
   void _onFeatures() {
@@ -492,9 +495,9 @@ class _HomeTabState extends State<_HomeTab> {
     final ws = agent.info['workspace'] as String? ?? '';
     final slug = q.title.toLowerCase().replaceAll(RegExp(r'[^a-z0-9]+'), '-').replaceAll(RegExp(r'^-|-$'), '');
     final n = DateTime.now();
-    final dir = Directory('$ws/$slug-${n.month}${n.day}-${n.hour}${n.minute.toString().padLeft(2, '0')}')
-      ..createSync(recursive: true);
-    await agent.newSession(dir: dir.path);
+    final dir = '$ws/$slug-${n.month}${n.day}-${n.hour}${n.minute.toString().padLeft(2, '0')}';
+    await agent.fs.mkdir(dir);
+    await agent.newSession(dir: dir);
     if (mounted) await openChat(context, agent, prompt: q.prompt);
     _refresh();
   }

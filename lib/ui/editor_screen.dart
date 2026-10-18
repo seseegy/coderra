@@ -1,7 +1,7 @@
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:re_editor/re_editor.dart';
@@ -38,8 +38,9 @@ import 'package:re_highlight/languages/yaml.dart';
 import 'package:re_highlight/re_highlight.dart' show Mode;
 
 import '../agent/agent_controller.dart';
+import '../agent/agent_fs.dart';
 import 'illustration.dart';
-import 'preview_screen.dart';
+import 'preview_open.dart';
 import 'theme.dart';
 
 /// Files bigger than this open read-only: the editor keeps every line in memory and re-highlights on edits.
@@ -75,6 +76,10 @@ class _EditorScreenState extends State<EditorScreen> {
   String _saved = '';
   int _size = 0;
 
+  /// When the file was last changed, as of the last time this screen read or wrote it. A save is refused if the file has
+  /// moved on since (the agent edited it, or it is gone), so a stale editor never overwrites newer work.
+  DateTime? _modified;
+
   String get _name => widget.path.split('/').last;
   String get _ext => _name.contains('.') ? _name.split('.').last.toLowerCase() : '';
   bool get _previewable => const {'html', 'htm', 'svg'}.contains(_ext);
@@ -96,8 +101,9 @@ class _EditorScreenState extends State<EditorScreen> {
 
   Future<void> _load() async {
     try {
-      final file = File(widget.path);
-      final bytes = await file.readAsBytes();
+      // Noted before reading: if the file changes in between, the save will notice.
+      _modified = (await widget.agent.fs.stat(widget.path)).modified;
+      final bytes = await widget.agent.fs.read(widget.path);
       _size = bytes.length;
       final head = bytes.length > 8192 ? bytes.sublist(0, 8192) : bytes;
       if (head.contains(0)) {
@@ -139,20 +145,33 @@ class _EditorScreenState extends State<EditorScreen> {
     final canUndo = _controller.canUndo;
     final canRedo = _controller.canRedo;
     if (dirty != _dirty || canUndo != _canUndo || canRedo != _canRedo) {
-      setState(() {
-        _dirty = dirty;
-        _canUndo = canUndo;
-        _canRedo = canRedo;
-      });
+      void apply() {
+        if (!mounted) return;
+        setState(() {
+          _dirty = dirty;
+          _canUndo = canUndo;
+          _canRedo = canRedo;
+        });
+      }
+
+      // The editor can change its controller while it is being built (placing the cursor); a rebuild then has to wait.
+      if (WidgetsBinding.instance.schedulerPhase == SchedulerPhase.persistentCallbacks) {
+        WidgetsBinding.instance.addPostFrameCallback((_) => apply());
+      } else {
+        apply();
+      }
     }
   }
 
-  Future<bool> _save() async {
+  /// Saves the text. If the file changed underneath in the meantime, asks what to do with the edits instead of
+  /// overwriting; [overwrite] skips that check (the user just chose to). True when the text ended up saved.
+  Future<bool> _save({bool overwrite = false}) async {
     if (_readOnly || _saving) return false;
     setState(() => _saving = true);
     try {
       final text = _controller.text;
-      await File(widget.path).writeAsString(text);
+      final stat = await widget.agent.fs.writeString(widget.path, text, expectModified: overwrite ? null : _modified);
+      _modified = stat.modified;
       _saved = text;
       if (!mounted) return true;
       setState(() {
@@ -163,12 +182,81 @@ class _EditorScreenState extends State<EditorScreen> {
         ..hideCurrentSnackBar()
         ..showSnackBar(const SnackBar(content: Text('Saved'), duration: Duration(seconds: 1)));
       return true;
+    } on FsConflictException {
+      if (!mounted) return false;
+      setState(() => _saving = false);
+      return _resolveConflict();
     } catch (e) {
       if (!mounted) return false;
       setState(() => _saving = false);
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
       return false;
     }
+  }
+
+  /// The file is not what it was when this screen opened it. Nothing is written until the user says how.
+  Future<bool> _resolveConflict() async {
+    final fs = widget.agent.fs;
+    final gone = !await fs.exists(widget.path);
+    if (!mounted) return false;
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(gone ? 'File was deleted' : 'File changed'),
+        content: Text(
+          gone
+              ? '$_name was deleted while you were editing it. Your edits are still here.'
+              : '$_name was changed by something else (the agent, perhaps) while you were editing it. '
+                    'What should happen to your edits?',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Keep editing')),
+          TextButton(onPressed: () => Navigator.pop(ctx, 'copy'), child: const Text('Save as copy')),
+          if (!gone) TextButton(onPressed: () => Navigator.pop(ctx, 'reload'), child: const Text('Load theirs')),
+          TextButton(onPressed: () => Navigator.pop(ctx, 'overwrite'), child: Text(gone ? 'Recreate' : 'Overwrite')),
+        ],
+      ),
+    );
+    if (!mounted || choice == null) return false;
+    switch (choice) {
+      case 'overwrite':
+        return _save(overwrite: true);
+      case 'reload':
+        await _reload();
+        return false;
+      case 'copy':
+        try {
+          final target = await freeCopyPath(fs, widget.path);
+          await fs.writeString(target, _controller.text);
+          if (!mounted) return false;
+          // The edits are safe in the copy; the editor goes back to the file as it is now (or empty if it is gone).
+          if (gone) {
+            setState(() => _dirty = false);
+          } else {
+            await _reload();
+          }
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Your version was saved as ${baseName(target)}')));
+          }
+        } catch (e) {
+          if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+        }
+        return false;
+    }
+    return false;
+  }
+
+  /// Reads the file again and drops the edits.
+  Future<void> _reload() async {
+    _controller.removeListener(_onChanged);
+    setState(() {
+      _loading = true;
+      _dirty = false;
+      // The history goes with the edits; stale flags would make the new editor "change" them while it is built.
+      _canUndo = false;
+      _canRedo = false;
+    });
+    await _load();
   }
 
   Future<void> _confirmLeave() async {
@@ -201,9 +289,12 @@ class _EditorScreenState extends State<EditorScreen> {
     }
   }
 
-  void _preview() {
-    final dir = widget.path.substring(0, widget.path.lastIndexOf('/').clamp(0, widget.path.length));
-    HtmlPreviewScreen.open(context, title: _name, source: () => _controller.text, baseDir: dir);
+  Future<void> _preview() async {
+    final agent = widget.agent;
+    // A page on a server is opened from the server's copy, so what is on screen has to be saved first.
+    if (!agent.fs.isLocal && _dirty && !await _save()) return;
+    if (!mounted) return;
+    await openFilePreview(context, agent, title: _name, path: widget.path, source: () => _controller.text);
   }
 
   Future<void> _copyAll() async {

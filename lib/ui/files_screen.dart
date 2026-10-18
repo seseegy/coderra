@@ -1,17 +1,17 @@
-import 'dart:io';
-
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../agent/agent_controller.dart';
+import '../agent/agent_fs.dart';
 import 'db_screen.dart';
 import 'editor_screen.dart';
 import 'illustration.dart';
-import 'preview_screen.dart';
+import 'preview_open.dart';
 import 'search_screen.dart';
 import 'theme.dart';
+import 'transfer_dialog.dart';
 
 const _imageExts = {'png', 'jpg', 'jpeg', 'gif', 'webp'};
 const _htmlExts = {'html', 'htm', 'svg'};
@@ -99,13 +99,7 @@ IconData _iconFor(String name, bool isDir) {
 }
 
 /// One listed directory entry with its stat, captured once per refresh so sorting and rendering stay cheap.
-class _Entry {
-  _Entry(this.path, this.isDir, this.stat);
-  final String path;
-  final bool isDir;
-  final FileStat stat;
-  String get name => _baseName(path);
-}
+typedef _Entry = FsEntry;
 
 /// Browses the project on disk so the user can look at, open and tidy files without asking the agent.
 class FilesScreen extends StatefulWidget {
@@ -128,6 +122,7 @@ class _FilesScreenState extends State<FilesScreen> {
   String? _error;
 
   AgentController get agent => widget.agent;
+  AgentFs get fs => agent.fs;
 
   static String _normalize(String p) => p.length > 1 && p.endsWith('/') ? p.substring(0, p.length - 1) : p;
 
@@ -139,12 +134,7 @@ class _FilesScreenState extends State<FilesScreen> {
 
   Future<void> _load() async {
     try {
-      final items = <_Entry>[];
-      await for (final e in Directory(_dir).list(followLinks: false)) {
-        FileStat stat = await e.stat();
-        if (e is Link) stat = await FileStat.stat(e.path);
-        items.add(_Entry(e.path, stat.type == FileSystemEntityType.directory, stat));
-      }
+      final items = await fs.list(_dir);
       items.sort((a, b) {
         if (a.isDir != b.isDir) return a.isDir ? -1 : 1;
         return a.name.toLowerCase().compareTo(b.name.toLowerCase());
@@ -186,7 +176,7 @@ class _FilesScreenState extends State<FilesScreen> {
     final ext = _extOf(e.name);
     final nav = Navigator.of(context);
     if (_imageExts.contains(ext)) {
-      await nav.push(MaterialPageRoute(builder: (_) => _ImageViewer(path: e.path)));
+      await nav.push(MaterialPageRoute(builder: (_) => _ImageViewer(fs: fs, path: e.path)));
     } else if (_dbExts.contains(ext)) {
       await nav.push(
         MaterialPageRoute(
@@ -228,12 +218,7 @@ class _FilesScreenState extends State<FilesScreen> {
     );
     if (!mounted || choice == null) return;
     if (choice == 'preview') {
-      await HtmlPreviewScreen.open(
-        context,
-        title: e.name,
-        source: () => File(e.path).readAsStringSync(),
-        baseDir: _dirName(e.path),
-      );
+      await openFilePreview(context, agent, title: e.name, path: e.path, source: () => fs.readString(e.path));
     } else {
       await Navigator.of(context).push(
         MaterialPageRoute(
@@ -280,13 +265,13 @@ class _FilesScreenState extends State<FilesScreen> {
     if (name == null) return;
     final path = _join(_dir, name);
     try {
-      if (await FileSystemEntity.type(path) != FileSystemEntityType.notFound) return _snack('$name already exists');
-      final file = await File(path).create(recursive: true);
+      if (await fs.exists(path)) return _snack('$name already exists');
+      await fs.createFile(path);
       await _load();
       if (!mounted) return;
       await Navigator.of(context).push(
         MaterialPageRoute(
-          builder: (_) => EditorScreen(agent: agent, path: file.path),
+          builder: (_) => EditorScreen(agent: agent, path: path),
         ),
       );
       if (mounted) _load();
@@ -300,8 +285,8 @@ class _FilesScreenState extends State<FilesScreen> {
     if (name == null) return;
     final path = _join(_dir, name);
     try {
-      if (await FileSystemEntity.type(path) != FileSystemEntityType.notFound) return _snack('$name already exists');
-      await Directory(path).create(recursive: true);
+      if (await fs.exists(path)) return _snack('$name already exists');
+      await fs.mkdir(path);
       await _load();
     } catch (e) {
       _snack('$e');
@@ -313,12 +298,8 @@ class _FilesScreenState extends State<FilesScreen> {
     if (name == null || name == e.name) return;
     final target = _join(_dirName(e.path), name);
     try {
-      if (await FileSystemEntity.type(target) != FileSystemEntityType.notFound) return _snack('$name already exists');
-      if (e.isDir) {
-        await Directory(e.path).rename(target);
-      } else {
-        await File(e.path).rename(target);
-      }
+      if (await fs.exists(target)) return _snack('$name already exists');
+      await fs.rename(e.path, target);
       await _load();
     } catch (err) {
       _snack('$err');
@@ -331,33 +312,15 @@ class _FilesScreenState extends State<FilesScreen> {
     final stem = ext.isEmpty ? e.name : e.name.substring(0, e.name.length - ext.length - 1);
     String candidate(int n) => '$stem copy${n > 1 ? ' $n' : ''}${ext.isEmpty ? '' : '.$ext'}';
     var n = 1;
-    while (await FileSystemEntity.type(_join(dir, candidate(n))) != FileSystemEntityType.notFound) {
+    while (await fs.exists(_join(dir, candidate(n)))) {
       n++;
     }
     final target = _join(dir, candidate(n));
     try {
-      if (e.isDir) {
-        await _copyDir(Directory(e.path), Directory(target));
-      } else {
-        await File(e.path).copy(target);
-      }
+      await fs.copy(e.path, target);
       await _load();
     } catch (err) {
       _snack('$err');
-    }
-  }
-
-  Future<void> _copyDir(Directory from, Directory to) async {
-    await to.create(recursive: true);
-    await for (final child in from.list(followLinks: false)) {
-      final dest = _join(to.path, _baseName(child.path));
-      if (child is Directory) {
-        await _copyDir(child, Directory(dest));
-      } else if (child is File) {
-        await child.copy(dest);
-      } else if (child is Link) {
-        await Link(dest).create(await child.target());
-      }
     }
   }
 
@@ -381,11 +344,7 @@ class _FilesScreenState extends State<FilesScreen> {
     );
     if (ok != true) return;
     try {
-      if (e.isDir) {
-        await Directory(e.path).delete(recursive: true);
-      } else {
-        await File(e.path).delete();
-      }
+      await fs.delete(e.path, recursive: e.isDir);
       await _load();
     } catch (err) {
       _snack('$err');
@@ -416,15 +375,26 @@ class _FilesScreenState extends State<FilesScreen> {
       case 'copy':
         await _copyPath(e);
       case 'share':
-        await agent.client.shareFile(e.path);
+        final local = await _fetch(e);
+        if (local != null) await agent.client.shareFile(local);
       case 'download':
+        final local = await _fetch(e);
+        if (local == null) return;
         try {
-          _snack('Saved to ${await agent.client.saveToDownloads(e.path)}');
+          _snack('Saved to ${await agent.client.saveToDownloads(local)}');
         } catch (err) {
           _snack('$err');
         }
     }
   }
+
+  /// The file on this phone: itself, or (with a server agent) a copy fetched with a progress dialog. Null if stopped.
+  Future<String?> _fetch(_Entry e) => runTransfer<String>(
+    context,
+    title: 'Downloading ${e.name}',
+    show: !fs.isLocal,
+    task: (h) => fs.toPhoneFile(e.path, onProgress: h.onProgress, cancel: h.cancel),
+  );
 
   /// Copies files picked from the phone into the folder being viewed.
   Future<void> _import() async {
@@ -433,17 +403,27 @@ class _FilesScreenState extends State<FilesScreen> {
     for (final f in picked) {
       if (f.path == null) continue;
       var target = _join(_dir, f.name);
-      if (File(target).existsSync()) {
+      if (await fs.exists(target)) {
         final dot = f.name.lastIndexOf('.');
         final stem = dot > 0 ? f.name.substring(0, dot) : f.name;
         final ext = dot > 0 ? f.name.substring(dot) : '';
         var n = 2;
-        while (File(target).existsSync()) {
+        while (await fs.exists(target)) {
           target = _join(_dir, '$stem ($n)$ext');
           n++;
         }
       }
-      await File(f.path!).copy(target);
+      if (!mounted) return;
+      final ok = await runTransfer<bool>(
+        context,
+        title: 'Uploading ${f.name}',
+        show: !fs.isLocal,
+        task: (h) async {
+          await fs.upload(f.path!, target, onProgress: h.onProgress, cancel: h.cancel);
+          return true;
+        },
+      );
+      if (ok != true) break; // stopped, or failed (already said so): the rest would only fail the same way
       count++;
     }
     if (count == 0) return;
@@ -640,7 +620,7 @@ class _FilesScreenState extends State<FilesScreen> {
     } else {
       tint = p.muted;
     }
-    final meta = [if (!e.isDir) _formatSize(e.stat.size), _formatTime(e.stat.modified)].join(' · ');
+    final meta = [if (!e.isDir) _formatSize(e.size), _formatTime(e.modified)].join(' · ');
     return InkWell(
       borderRadius: BorderRadius.circular(12),
       onTap: () => _open(e),
@@ -774,13 +754,24 @@ class _BreadcrumbsState extends State<_Breadcrumbs> {
 }
 
 /// Full-screen pinch-zoom viewer for an image file.
-class _ImageViewer extends StatelessWidget {
-  const _ImageViewer({required this.path});
+class _ImageViewer extends StatefulWidget {
+  const _ImageViewer({required this.fs, required this.path});
+  final AgentFs fs;
   final String path;
+
+  @override
+  State<_ImageViewer> createState() => _ImageViewerState();
+}
+
+class _ImageViewerState extends State<_ImageViewer> {
+  late final Future<Uint8List> _bytes = widget.fs.read(widget.path);
+
+  String get path => widget.path;
 
   @override
   Widget build(BuildContext context) {
     final p = context.palette;
+    final cantDisplay = Text("Can't display this image", style: TextStyle(color: p.faint));
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
@@ -805,9 +796,14 @@ class _ImageViewer extends StatelessWidget {
         minScale: 0.5,
         maxScale: 8,
         child: Center(
-          child: Image.file(
-            File(path),
-            errorBuilder: (_, e, _) => Text("Can't display this image", style: TextStyle(color: p.faint)),
+          child: FutureBuilder<Uint8List>(
+            future: _bytes,
+            builder: (context, snap) {
+              if (snap.hasError) return cantDisplay;
+              final bytes = snap.data;
+              if (bytes == null) return const CircularProgressIndicator();
+              return Image.memory(bytes, errorBuilder: (_, e, _) => cantDisplay);
+            },
           ),
         ),
       ),

@@ -1,9 +1,8 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../agent/agent_controller.dart';
+import '../agent/agent_fs.dart';
 import 'kit.dart';
 import 'theme.dart';
 
@@ -42,6 +41,11 @@ class _FolderPickerState extends State<FolderPicker> with WidgetsBindingObserver
   late String path = workspace;
   bool showHidden = false;
 
+  /// The folders under [path], filled in by [_load].
+  List<FsEntry> folders = const [];
+  bool loading = true;
+  int _loadId = 0;
+
   String get base => root == _Root.workspace ? workspace : phoneRoot;
 
   @override
@@ -49,6 +53,7 @@ class _FolderPickerState extends State<FolderPicker> with WidgetsBindingObserver
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _checkAccess();
+    _load();
   }
 
   @override
@@ -64,6 +69,17 @@ class _FolderPickerState extends State<FolderPicker> with WidgetsBindingObserver
   }
 
   Future<void> _checkAccess() async {
+    // With a server agent the folders are the server's: this phone's storage is not on offer, and neither is the
+    // permission to read it.
+    if (widget.agent.client.isRemote) {
+      if (!mounted) return;
+      setState(() {
+        phoneAvailable = false;
+        phoneGranted = false;
+        root = _Root.workspace;
+      });
+      return;
+    }
     final a = await widget.agent.client.storageAccess();
     if (!mounted) return;
     setState(() {
@@ -75,24 +91,42 @@ class _FolderPickerState extends State<FolderPicker> with WidgetsBindingObserver
       }
       phoneRoot = a.root;
     });
+    _load();
   }
 
-  void _switch(_Root r) => setState(() {
-    root = r;
-    path = base;
-  });
+  void _switch(_Root r) {
+    setState(() {
+      root = r;
+      path = base;
+    });
+    _load();
+  }
 
-  List<Directory> _children() {
+  /// Shows [target] and lists its folders.
+  void _go(String target) {
+    setState(() => path = target);
+    _load();
+  }
+
+  /// Lists the folders under [path] (not links, hidden ones only on request). Call after [path], [root] or
+  /// [showHidden] changes.
+  Future<void> _load() async {
+    final id = ++_loadId;
+    if (!loading && mounted) setState(() => loading = true);
+    List<FsEntry> dirs;
     try {
-      final dirs = Directory(path).listSync(followLinks: false).whereType<Directory>().where((d) {
-        final name = folderName(d.path);
-        return showHidden || !name.startsWith('.');
-      }).toList();
-      dirs.sort((a, b) => folderName(a.path).toLowerCase().compareTo(folderName(b.path).toLowerCase()));
-      return dirs;
+      dirs = (await widget.agent.fs.list(path, detectGit: true))
+          .where((e) => e.isDir && !e.isLink && (showHidden || !e.name.startsWith('.')))
+          .toList();
+      dirs.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
     } catch (_) {
-      return const [];
+      dirs = const [];
     }
+    if (!mounted || id != _loadId) return;
+    setState(() {
+      folders = dirs;
+      loading = false;
+    });
   }
 
   /// Deletes a project folder from the workspace, permanently.
@@ -100,8 +134,8 @@ class _FolderPickerState extends State<FolderPicker> with WidgetsBindingObserver
   /// Only offered for folders inside the workspace (never phone storage and
   /// never the workspace root itself). The folder the active session is
   /// working in — or any folder containing it — is refused.
-  Future<void> _deleteProject(Directory dir) async {
-    final name = folderName(dir.path);
+  Future<void> _deleteProject(FsEntry dir) async {
+    final name = dir.name;
     final cwd = widget.agent.cwd;
     if (cwd == dir.path || cwd.startsWith('${dir.path}/')) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -128,10 +162,10 @@ class _FolderPickerState extends State<FolderPicker> with WidgetsBindingObserver
     );
     if (ok != true) return;
     try {
-      await dir.delete(recursive: true);
+      await widget.agent.fs.delete(dir.path, recursive: true);
       widget.agent.integrations.refreshProjects().catchError((_) {});
       if (mounted) {
-        setState(() {});
+        _load();
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Project "$name" deleted')));
       }
     } catch (e) {
@@ -140,7 +174,7 @@ class _FolderPickerState extends State<FolderPicker> with WidgetsBindingObserver
   }
 
   /// Actions for one listed folder: open it, or (in the workspace) delete it.
-  Future<void> _folderActions(Directory dir) async {
+  Future<void> _folderActions(FsEntry dir) async {
     final canDelete = root == _Root.workspace;
     final action = await showModalBottomSheet<String>(
       context: context,
@@ -167,36 +201,23 @@ class _FolderPickerState extends State<FolderPicker> with WidgetsBindingObserver
     );
     if (!mounted) return;
     if (action == 'open') {
-      setState(() => path = dir.path);
+      _go(dir.path);
     } else if (action == 'delete') {
       await _deleteProject(dir);
     }
   }
 
   Future<void> _newFolder() async {
-    final controller = TextEditingController();
     final name = await showDialog<String>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('New folder'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          decoration: const InputDecoration(hintText: 'my-project'),
-          onSubmitted: (v) => Navigator.pop(context, v),
-        ),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.pop(context, controller.text), child: const Text('Create')),
-        ],
-      ),
+      builder: (_) => const _NameDialog(title: 'New folder', hint: 'my-project', action: 'Create'),
     );
-    controller.dispose();
     final clean = name?.trim().replaceAll(RegExp(r'[/\\:*?"<>|]+'), '-');
     if (clean == null || clean.isEmpty) return;
     try {
-      final dir = Directory('$path/$clean')..createSync(recursive: true);
-      setState(() => path = dir.path);
+      final target = '$path/$clean';
+      await widget.agent.fs.mkdir(target);
+      if (mounted) _go(target);
     } catch (e) {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not create it: $e')));
     }
@@ -208,7 +229,7 @@ class _FolderPickerState extends State<FolderPicker> with WidgetsBindingObserver
     final text = Theme.of(context).textTheme;
     final locked = root == _Root.phone && !phoneGranted;
     final crumbs = path.substring(base.length).split('/').where((s) => s.isNotEmpty).toList();
-    final children = locked ? const <Directory>[] : _children();
+    final children = locked ? const <FsEntry>[] : folders;
 
     return Scaffold(
       appBar: AppBar(
@@ -217,7 +238,10 @@ class _FolderPickerState extends State<FolderPicker> with WidgetsBindingObserver
           IconButton(
             tooltip: showHidden ? 'Hide hidden folders' : 'Show hidden folders',
             icon: Icon(showHidden ? LucideIcons.eye : LucideIcons.eyeOff, size: 18),
-            onPressed: () => setState(() => showHidden = !showHidden),
+            onPressed: () {
+              setState(() => showHidden = !showHidden);
+              _load();
+            },
           ),
           if (!locked)
             IconButton(
@@ -268,17 +292,17 @@ class _FolderPickerState extends State<FolderPicker> with WidgetsBindingObserver
               padding: const EdgeInsets.symmetric(horizontal: 16),
               children: [
                 _Crumb(
-                  label: root == _Root.workspace ? 'workspace' : 'phone',
+                  label: root == _Root.workspace ? (widget.agent.client.isRemote ? 'server' : 'workspace') : 'phone',
                   icon: root == _Root.workspace ? LucideIcons.boxes : LucideIcons.smartphone,
                   active: crumbs.isEmpty,
-                  onTap: () => setState(() => path = base),
+                  onTap: () => _go(base),
                 ),
                 for (var i = 0; i < crumbs.length; i++) ...[
                   Icon(LucideIcons.chevronRight, size: 14, color: p.faint),
                   _Crumb(
                     label: crumbs[i],
                     active: i == crumbs.length - 1,
-                    onTap: () => setState(() => path = '$base/${crumbs.take(i + 1).join('/')}'),
+                    onTap: () => _go('$base/${crumbs.take(i + 1).join('/')}'),
                   ),
                 ],
               ],
@@ -315,6 +339,8 @@ class _FolderPickerState extends State<FolderPicker> with WidgetsBindingObserver
                       ),
                     ],
                   )
+                : loading && children.isEmpty
+                ? const Center(child: CircularProgressIndicator(strokeWidth: 2))
                 : children.isEmpty
                 ? Center(child: Text('No folders here', style: text.bodySmall))
                 : ListView.builder(
@@ -322,7 +348,7 @@ class _FolderPickerState extends State<FolderPicker> with WidgetsBindingObserver
                     itemCount: children.length,
                     itemBuilder: (context, i) {
                       final d = children[i];
-                      final git = Directory('${d.path}/.git').existsSync();
+                      final git = d.isGit;
                       return ListTile(
                         contentPadding: const EdgeInsets.symmetric(horizontal: 12),
                         leading: IconTile(
@@ -339,7 +365,7 @@ class _FolderPickerState extends State<FolderPicker> with WidgetsBindingObserver
                                 onPressed: () => _folderActions(d),
                               )
                             : Icon(LucideIcons.chevronRight, size: 16, color: p.faint),
-                        onTap: () => setState(() => path = d.path),
+                        onTap: () => _go(d.path),
                         onLongPress: root == _Root.workspace ? () => _folderActions(d) : null,
                       );
                     },
@@ -395,6 +421,45 @@ class _Crumb extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+/// Asks for one line of text. The dialog owns its controller, so the controller is disposed only once the dialog has
+/// left the tree; disposing it right after `showDialog` returns would leave the closing dialog using a dead controller.
+class _NameDialog extends StatefulWidget {
+  const _NameDialog({required this.title, required this.hint, required this.action});
+  final String title;
+  final String hint;
+  final String action;
+
+  @override
+  State<_NameDialog> createState() => _NameDialogState();
+}
+
+class _NameDialogState extends State<_NameDialog> {
+  final controller = TextEditingController();
+
+  @override
+  void dispose() {
+    controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(widget.title),
+      content: TextField(
+        controller: controller,
+        autofocus: true,
+        decoration: InputDecoration(hintText: widget.hint),
+        onSubmitted: (v) => Navigator.pop(context, v),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+        FilledButton(onPressed: () => Navigator.pop(context, controller.text), child: Text(widget.action)),
+      ],
     );
   }
 }

@@ -24,7 +24,7 @@ class HtmlPreviewScreen extends StatefulWidget {
       );
 
   final String title;
-  final String Function() source;
+  final FutureOr<String> Function() source;
 
   /// Directory relative links (css, js, images) resolve against.
   final String? baseDir;
@@ -33,7 +33,7 @@ class HtmlPreviewScreen extends StatefulWidget {
   static Future<void> open(
     BuildContext context, {
     required String title,
-    required String Function() source,
+    required FutureOr<String> Function() source,
     String? baseDir,
     Listenable? live,
   }) {
@@ -87,13 +87,14 @@ class _HtmlPreviewScreenState extends State<HtmlPreviewScreen> {
     debounce = Timer(const Duration(milliseconds: 400), _reload);
   }
 
-  void _reload({bool force = false}) {
+  Future<void> _reload({bool force = false}) async {
     if (widget.url != null) {
       controller.loadRequest(Uri.parse(widget.url!));
       return;
     }
     if (!mounted) return;
-    final html = widget.source();
+    final html = await widget.source();
+    if (!mounted) return;
     if (!force && html == loaded) return;
     loaded = html;
     final base = widget.baseDir == null ? null : Uri.directory(widget.baseDir!).toString();

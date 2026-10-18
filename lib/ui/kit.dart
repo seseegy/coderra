@@ -328,5 +328,7 @@ IconData toolIcon(String? name) => switch (name) {
   'find' || 'ls' => LucideIcons.folderSearch,
   'web_search' => LucideIcons.search,
   'web_fetch' => LucideIcons.globe,
+  'tasks' => LucideIcons.listChecks,
+  'subagent' => LucideIcons.bot,
   _ => LucideIcons.wrench,
 };
