@@ -5,7 +5,8 @@
  * in seseegy/coderra and builds the APK with --build-number=<run number>,
  * so comparing numbers is enough. The running build reaches the host as
  * ANDROPI_APP_BUILD / ANDROPI_APP_VERSION (set by AgentRuntime from the
- * package manager). The check needs the user's GitHub sign-in because the
+ * package manager). Split-per-ABI APKs add an ABI offset to versionCode;
+ * AgentRuntime strips it (versionCode % 1000) so the value is the run number. The check needs the user's GitHub sign-in because the
  * repository is private, and successful lookups are cached for 6 hours in
  * <agentDir>/andropi/update-check.json so opening Settings stays cheap.
  */
