@@ -22,4 +22,5 @@ export function endsUnfinished(entry: unknown): boolean {
 	}
 }
 
-export const CONTINUE_CHAT = "Carry on from where you left off. The previous request was cut off when the host restarted. If a command was interrupted, check what state it left behind before running it again.";
+/** Sent by Continue. It claims no cause, because none is known: the model would otherwise reason from one that never happened. */
+export const CONTINUE_CHAT = "Carry on from where you left off. The previous request stopped before it finished. If a command was interrupted, check what state it left behind before running it again.";

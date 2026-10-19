@@ -7,6 +7,11 @@ String tr(String en) => Appearance.instance.language == 'id' ? (_id[en] ?? en) :
 const languages = {'en': 'English', 'id': 'Bahasa Indonesia'};
 
 const _id = <String, String>{
+  // Switching chats while the agent works
+  'The agent is still working': 'Agent masih bekerja',
+  'Switching to another chat now stops what it is doing in this one.': 'Pindah ke chat lain sekarang akan menghentikan pekerjaannya di chat ini.',
+  'Let it finish': 'Biarkan selesai',
+  'Stop and switch': 'Hentikan dan pindah',
   // Home and navigation
   'Settings': 'Pengaturan',
   'Chats': 'Chat',

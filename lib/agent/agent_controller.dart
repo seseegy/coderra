@@ -42,8 +42,13 @@ class AgentController extends ChangeNotifier {
   String cwd = '';
   bool busy = false;
 
-  /// The chat stops in the middle of something and nothing is running (the host was cut off while it worked).
+  /// The chat stops in the middle of something and nothing is running. Why is not known: the host may have stopped, the
+  /// run may have been stopped, or the chat was switched away from while it worked.
   bool interrupted = false;
+
+  /// Asked before switching away from a chat the agent is still working in, which stops it. Set by the home screen;
+  /// without it such a switch is refused.
+  Future<bool> Function(String message)? confirmStop;
 
   /// Set when the current model is billed differently than the user may expect.
   String? billingNotice;
@@ -114,17 +119,38 @@ class AgentController extends ChangeNotifier {
 
   Future<void> abort() => client.call('abort');
 
-  /// Starts a session, in [dir] when given (a project folder), else the workspace.
-  Future<void> newSession({String? dir}) async {
-    _applyState(await client.call<Map<String, dynamic>>('new_session', {'cwd': ?dir}));
+  /// Starts a session, in [dir] when given (a project folder), else the workspace. False when the user chose to let
+  /// the agent finish the chat it is working in instead.
+  Future<bool> newSession({String? dir}) async {
+    final r = await _switch('new_session', {'cwd': ?dir});
+    if (r == null) return false;
+    _applyState(r);
     _resetTranscript();
     notifyListeners();
     _loadTasks();
+    return true;
   }
 
-  Future<void> openSession(String path) async {
-    _applyState(await client.call<Map<String, dynamic>>('open_session', {'path': path}));
+  /// Opens a saved chat. False when the user chose to let the agent finish the chat it is working in instead.
+  Future<bool> openSession(String path) async {
+    final r = await _switch('open_session', {'path': path});
+    if (r == null) return false;
+    _applyState(r);
     await loadHistory();
+    return true;
+  }
+
+  /// A command that replaces the open chat. The host refuses (`busy`) while the agent works in it, since that stops it;
+  /// the user decides. Null when they keep it running.
+  Future<Map<String, dynamic>?> _switch(String type, Map<String, dynamic> args) async {
+    try {
+      return await client.call<Map<String, dynamic>>(type, args);
+    } on AgentError catch (e) {
+      final ask = confirmStop;
+      if (e.code != 'busy' || ask == null) rethrow;
+      if (!await ask(e.message)) return null;
+      return client.call<Map<String, dynamic>>(type, {...args, 'force': true});
+    }
   }
 
   Future<void> renameSession(String path, String name) async {
@@ -222,7 +248,8 @@ class AgentController extends ChangeNotifier {
 
   /// Copies this chat into a new one, rewound to just before [entryId].
   Future<String> forkAt(String? entryId) async {
-    final r = (await client.call<Map>('fork_session', {'entryId': ?entryId})).cast<String, dynamic>();
+    final r = await _switch('fork_session', {'entryId': ?entryId});
+    if (r == null) throw AgentError('The agent is still working in this chat.', code: 'busy');
     _applyState(r);
     await loadHistory();
     return r['text'] as String? ?? '';
