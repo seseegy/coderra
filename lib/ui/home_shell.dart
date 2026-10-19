@@ -79,6 +79,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
           );
         }),
       );
+    agent.confirmStop = _confirmStop;
     f.addListener(_onFeatures);
     f.refreshRuns().catchError((_) {});
     agent.client.requestNotifications().catchError((_) {});
@@ -88,6 +89,7 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    if (agent.confirmStop == _confirmStop) agent.confirmStop = null;
     WidgetsBinding.instance.removeObserver(this);
     agent.features.removeListener(_onFeatures);
     for (final s in subs) {
@@ -112,6 +114,23 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
     approvalsSeen = pending.length;
   }
 
+  /// Switching to another chat while the agent works in this one stops it: the user decides.
+  Future<bool> _confirmStop(String message) async {
+    if (!mounted) return false;
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(tr('The agent is still working')),
+        content: Text(tr('Switching to another chat now stops what it is doing in this one.')),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: Text(tr('Let it finish'))),
+          FilledButton(onPressed: () => Navigator.pop(context, true), child: Text(tr('Stop and switch'))),
+        ],
+      ),
+    );
+    return go == true;
+  }
+
   Future<void> _takeLaunch() async {
     final launch = await agent.client.takeLaunch();
     if (launch == null || !mounted) return;
@@ -121,14 +140,15 @@ class _HomeShellState extends State<HomeShell> with WidgetsBindingObserver {
       case 'new_chat':
         await _newChat();
       case 'voice':
-        await agent.newSession();
+        if (!await agent.newSession()) return;
         if (mounted) await openChat(context, agent, listen: true);
       case 'share':
         final files = [
           for (final f in (launch['files'] as List? ?? const []).cast<Map>())
             Attachment(f['path'] as String, f['name'] as String, mime: f['mime'] as String?),
         ];
-        await agent.newSession();
+        // Kept the chat the agent works in: the shared text must not land there.
+        if (!await agent.newSession()) return;
         if (mounted) await openChat(context, agent, prompt: launch['text'] as String?, attachments: files);
     }
   }
@@ -497,7 +517,7 @@ class _HomeTabState extends State<_HomeTab> {
     final n = DateTime.now();
     final dir = '$ws/$slug-${n.month}${n.day}-${n.hour}${n.minute.toString().padLeft(2, '0')}';
     await agent.fs.mkdir(dir);
-    await agent.newSession(dir: dir);
+    if (!await agent.newSession(dir: dir)) return;
     if (mounted) await openChat(context, agent, prompt: q.prompt);
     _refresh();
   }

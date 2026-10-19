@@ -138,7 +138,7 @@ class _ConnectionBannerState extends State<ConnectionBanner> {
   }
 }
 
-/// "The last request was cut off": the host died while the agent worked. One button carries on.
+/// "The last request was cut off": the chat stopped half way and nothing is running. One button carries on.
 class InterruptedBar extends StatelessWidget {
   const InterruptedBar({super.key, required this.agent});
 

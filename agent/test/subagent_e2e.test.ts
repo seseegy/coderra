@@ -52,8 +52,17 @@ test("an explorer reads for the parent, with only read tools, and the parent get
 	assert.ok(JSON.stringify(c.events()).includes("read notes.txt"), "a progress line reached the app");
 	const files = sessionFiles(d.agentDir);
 	assert.equal(files.length, 2, "parent and child");
-	assert.ok(files.some((f) => readFileSync(f, "utf8").includes("↳ Read notes")));
+	const child = files.find((f) => readFileSync(f, "utf8").includes("↳ Read notes"));
+	assert.ok(child);
+	assert.match(child, /[\\/]subagents[\\/][^\\/]+\.jsonl$/, "kept in a folder of its own");
 	assert.deepEqual((await c.call("health")).runs, { running: 0, queued: 0 });
+
+	// The chat list (and so "the latest chat of this project") shows only the parent.
+	const listed = await c.call("sessions");
+	assert.deepEqual(listed.map((x: any) => x.path), [(await c.call("state")).sessionFile]);
+	// Its cost still counts in the usage summary.
+	const usage: { requests: number }[] = await c.call("usage", { days: 1 });
+	assert.equal(usage.reduce((n, r) => n + r.requests, 0), 4, "parent and child requests");
 });
 
 test("a worker can change files, is held to the unattended rules, and cannot start sub-agents of its own", async (t) => {

@@ -18,7 +18,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	type AgentSession,
@@ -244,7 +244,7 @@ function state() {
 		billingNotice: billingNotice(),
 		planMode: guard.planMode,
 		approvalMode: guard.mode,
-		// The chat stops in the middle of something and nothing is running: the host was cut off while it worked.
+		// The chat stops in the middle of something and nothing is running. Why is not known (see interrupted.ts).
 		interrupted: !s.isStreaming && endsUnfinished(s.sessionManager.getLeafEntry()),
 	};
 }
@@ -298,6 +298,8 @@ async function buildSession(sessionManager: SessionManager, opts: { interactive:
 }
 
 let lastUserText = "";
+/** A Continue is on its way into the chat (it may not be streaming yet). */
+let continuing = false;
 let fallbackTried = false;
 
 async function openSession(sessionManager: SessionManager) {
@@ -360,6 +362,20 @@ function billingNotice(): string | null {
 	return "Claude subscription sign-in bills third-party apps like this one per token from extra usage, not your plan limits. Manage it at claude.ai/settings/usage, or use an API key.";
 }
 
+/**
+ * Switching chats ends the active session, and ending it stops whatever it is doing. While the agent works, the app
+ * has to say that is meant (`force`); then the run is stopped first, so its end is written down before the session goes.
+ */
+async function leaveActiveSession(cmd: Command) {
+	const s = session;
+	if (!s?.isStreaming) return;
+	if (cmd.force !== true) {
+		throw Object.assign(new Error("The agent is still working in this chat. Switching now stops it. Wait for it to finish, or switch anyway."), { code: "busy" });
+	}
+	// A tool that ignores the stop signal must not keep the switch waiting forever.
+	await Promise.race([s.abort(), new Promise((r) => setTimeout(r, 10_000).unref())]);
+}
+
 /** Rebuilds the active session so tool settings (shell, MCP tools) take effect. */
 async function reopenSession() {
 	const s = session!;
@@ -381,6 +397,9 @@ const subagentDeps: SubagentDeps = {
 	create: (o) => createChild(o),
 };
 
+/** The folder, inside a project's sessions, that holds its sub-agents' conversations. */
+const SUBAGENT_SESSIONS = "subagents";
+
 /** A session for a sub-agent: its own conversation (named after the job, so it can be found), tools by role, nobody to ask. */
 async function createChild(o: { role: Role; cwd: string; model?: string; parentModel?: string; title: string }): Promise<ChildSession> {
 	const find = (name: string) => {
@@ -390,7 +409,9 @@ async function createChild(o: { role: Role; cwd: string; model?: string; parentM
 	const model = o.model ? find(o.model) : o.parentModel ? find(o.parentModel) : undefined;
 	if (o.model && !model) throw new Error(`Unknown model "${o.model}". Write it as provider/model.`);
 
-	const manager = SessionManager.create(o.cwd);
+	// Kept in a folder of their own under the project's sessions: out of the chat list and of "the latest chat" (which
+	// would open a child's conversation as the main chat), still counted by the usage summary, which walks every folder.
+	const manager = SessionManager.create(o.cwd, join(SessionManager.create(o.cwd).getSessionDir(), SUBAGENT_SESSIONS));
 	manager.appendSessionInfo(`↳ ${o.title}`);
 	const tools = o.role === "explorer" ? EXPLORER_TOOLS : TOOLS.filter((t) => t !== "subagent" && t !== "tasks");
 	const { session: cs } = await buildSession(manager, { interactive: false, tools, child: true, mcp: o.role === "worker" });
@@ -993,6 +1014,7 @@ async function handle(cmd: Command): Promise<unknown> {
 		case "fork_session": {
 			const source = s.sessionFile;
 			if (!source) throw new Error("Nothing to fork yet");
+			await leaveActiveSession(cmd);
 			await openSession(SessionManager.forkFrom(source, s.sessionManager.getCwd()));
 			const r = cmd.entryId ? await session!.navigateTree(cmd.entryId, {}) : { editorText: "" };
 			return { ...state(), text: r.editorText ?? "" };
@@ -1033,9 +1055,11 @@ async function handle(cmd: Command): Promise<unknown> {
 			return deleteCustomProvider(cmd);
 
 		case "new_session":
+			await leaveActiveSession(cmd);
 			return openSession(SessionManager.create(cmd.cwd ?? workspace));
 		case "sessions":
-			return (await SessionManager.listAll()).map((info) => ({
+			// Sub-agents from before they had a folder of their own are recognised by their name.
+			return (await SessionManager.listAll()).filter((info) => !info.name?.startsWith("↳ ")).map((info) => ({
 				path: info.path,
 				id: info.id,
 				cwd: info.cwd,
@@ -1045,6 +1069,9 @@ async function handle(cmd: Command): Promise<unknown> {
 				firstMessage: info.firstMessage,
 			}));
 		case "open_session":
+			// The chat that is already open stays as it is: opening it again would only stop it.
+			if (s.sessionFile && resolve(String(cmd.path)) === resolve(s.sessionFile)) return state();
+			await leaveActiveSession(cmd);
 			return openSession(SessionManager.open(cmd.path));
 		case "rename_session": {
 			const name = String(cmd.name ?? "").trim();
@@ -1228,9 +1255,15 @@ async function handle(cmd: Command): Promise<unknown> {
 			checkBudget();
 			await health.assertRoom();
 			return runner.enqueue(String(cmd.prompt ?? ""), cwd, cmd.title, "queue", cmd.task);
-		// Pick a chat up again after the host was cut off while it worked.
+		// Pick a chat up again that stopped before it finished. Only then, and only once: a second tap, another device or
+		// a retry must not send it again, nor into a run that is going.
 		case "continue_session":
-			s.prompt(CONTINUE_CHAT).catch((e) => send({ type: "error", message: String(e?.message ?? e) }));
+			if (s.isStreaming || continuing) throw Object.assign(new Error("The agent is already working."), { code: "busy" });
+			if (!endsUnfinished(s.sessionManager.getLeafEntry())) return state();
+			continuing = true;
+			s.prompt(CONTINUE_CHAT)
+				.catch((e) => send({ type: "error", message: String(e?.message ?? e) }))
+				.finally(() => void (continuing = false));
 			return state();
 		// Disk, memory, and what is running: for the app's server screen.
 		case "health": {

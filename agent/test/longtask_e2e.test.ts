@@ -190,5 +190,6 @@ test("a chat that was cut off by the host dying says so, and can be continued", 
 	await c2.call("continue_session");
 	await waitFor("the chat to carry on", () => c2.settled() >= 1);
 	assert.equal((await c2.call("state")).interrupted, false);
-	assert.match(lastUser(model.requests[1]), /cut off when the host restarted/);
+	assert.match(lastUser(model.requests[1]), /stopped before it finished/);
+	assert.doesNotMatch(lastUser(model.requests[1]), /restart/, "no cause is claimed: none is known");
 });
