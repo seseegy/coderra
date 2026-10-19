@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { appUpdateDownloadStatus, checkAppUpdate, pickAsset, startAppUpdateDownload } from "../src/update.js";
+import { appUpdateDownloadStatus, cancelAppUpdateDownload, checkAppUpdate, pickAsset, startAppUpdateDownload } from "../src/update.js";
 import { tempDir } from "./helpers.js";
 import { connect, startDaemon, waitFor } from "./host_helpers.js";
 
@@ -136,10 +136,73 @@ test("a download that comes up short is an error and leaves no file", async (t) 
 });
 
 
+/** A download from GitHub that sends half the file and then waits until it is stopped. */
+function stalling(size: number) {
+	const calls: string[] = [];
+	return {
+		calls,
+		fn: async (path: string, init?: RequestInit) => {
+			calls.push(path);
+			const signal = init?.signal;
+			return new Response(
+				new ReadableStream({
+					start(c) {
+						c.enqueue(new Uint8Array(size / 2));
+						signal?.addEventListener("abort", () => c.error(new Error("aborted")));
+					},
+				}),
+			);
+		},
+	};
+}
+
+test("a second start while the APK is still coming joins it instead of downloading it twice", async (t) => {
+	const dir = tempDir(t);
+	const rel = release("b140", { assets: [{ id: 3, name: "app-arm64.apk", size: 400 }] });
+	const raw = stalling(400);
+	const first = await startAppUpdateDownload(dir, api(rel).fn, raw.fn);
+	await waitFor("half of it", () => appUpdateDownloadStatus(first.id).received === 200, 5000);
+	const second = await startAppUpdateDownload(dir, api(rel).fn, raw.fn);
+	assert.equal(second.id, first.id);
+	assert.equal(raw.calls.length, 1);
+	// A screen opened anew finds it, with its progress.
+	assert.deepEqual(appUpdateDownloadStatus(), { id: first.id, state: "downloading", received: 200, total: 400, tag: "b140" });
+
+	// Stopped: nothing is left behind, neither the APK nor its partial file.
+	assert.equal(cancelAppUpdateDownload(first.id).state, "cancelled");
+	await waitFor("the partial file to go", () => readdirSync(join(dir, "updates")).length === 0, 5000);
+	assert.equal(appUpdateDownloadStatus(first.id).state, "cancelled");
+});
+
+test("an APK that is already complete is not downloaded again, and a finished one can be put aside", async (t) => {
+	const dir = tempDir(t);
+	const rel = release("b141", { assets: [{ id: 3, name: "app-arm64.apk", size: 50 }] });
+	const raw = async () => new Response(Buffer.alloc(50, 1));
+	const first = await startAppUpdateDownload(dir, api(rel).fn, raw);
+	await waitFor("the download", () => appUpdateDownloadStatus(first.id).state === "done", 5000);
+	assert.deepEqual(readdirSync(join(dir, "updates")), ["b141-app-arm64.apk"]);
+
+	// Put aside: the screen no longer offers it, but the file stays for the next start.
+	assert.equal(cancelAppUpdateDownload(first.id).state, "cancelled");
+	assert.equal(appUpdateDownloadStatus().state, "cancelled");
+	assert.deepEqual(readdirSync(join(dir, "updates")), ["b141-app-arm64.apk"]);
+
+	let fetched = 0;
+	const again = await startAppUpdateDownload(dir, api(rel).fn, async () => {
+		fetched++;
+		return new Response(Buffer.alloc(50, 1));
+	});
+	assert.notEqual(again.id, first.id);
+	assert.equal(fetched, 0, "GitHub was not asked again");
+	assert.deepEqual(appUpdateDownloadStatus(again.id), { id: again.id, state: "done", received: 50, total: 50, tag: "b141", path: join(dir, "updates", "b141-app-arm64.apk") });
+});
 
 test("through the host: asking about a download gets an answer (it is looked up by downloadId, not by the request's id)", async (t) => {
 	const d = await startDaemon(t);
 	const c = await connect(d.sock);
 	const unknown = await c.call("app_update_status", { downloadId: "nope" });
 	assert.deepEqual([unknown.state, unknown.message], ["error", "Unknown download"]);
+	// Without an id: the download started last, here none yet; and stopping one that does not exist is no error.
+	assert.deepEqual(await c.call("app_update_status"), { state: "idle" });
+	assert.deepEqual(await c.call("app_update_cancel", { downloadId: "nope" }), { state: "idle" });
 });

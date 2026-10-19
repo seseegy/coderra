@@ -12,6 +12,7 @@ const _id = <String, String>{
   'Switching to another chat now stops what it is doing in this one.': 'Pindah ke chat lain sekarang akan menghentikan pekerjaannya di chat ini.',
   'Let it finish': 'Biarkan selesai',
   'Stop and switch': 'Hentikan dan pindah',
+  'Cancel download': 'Batalkan unduhan',
   // Home and navigation
   'Settings': 'Pengaturan',
   'Chats': 'Chat',

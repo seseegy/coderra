@@ -36,7 +36,7 @@ import { Checkpoints } from "./checkpoints.js";
 import { Fs, isFsCommand, runFsCommand } from "./fs.js";
 import { Container, type Distro } from "./container.js";
 import { installDohLookup } from "./dns.js";
-import { appUpdateDownloadStatus, checkAppUpdate, startAppUpdateDownload } from "./update.js";
+import { appUpdateDownloadStatus, cancelAppUpdateDownload, checkAppUpdate, startAppUpdateDownload } from "./update.js";
 import * as gitops from "./gitops.js";
 import { Guard } from "./guard.js";
 import { Integrations, type Log } from "./integrations.js";
@@ -1104,7 +1104,9 @@ async function handle(cmd: Command): Promise<unknown> {
 				typeof (cmd as any).abi === "string" ? (cmd as any).abi : undefined,
 			);
 		case "app_update_status":
-			return appUpdateDownloadStatus(String((cmd as any).downloadId ?? ""));
+			return appUpdateDownloadStatus((cmd as any).downloadId ? String((cmd as any).downloadId) : undefined);
+		case "app_update_cancel":
+			return cancelAppUpdateDownload(String((cmd as any).downloadId ?? ""));
 		case "github_login":
 			return integrations.githubLogin(cmd.token);
 		case "github_device_start":

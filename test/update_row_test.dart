@@ -26,6 +26,7 @@ void main() {
   late List<Map<String, dynamic>> commands;
   late Map<String, dynamic> checkAnswer;
   late List<Map<String, dynamic>> statusAnswers;
+  late Map<String, dynamic> lastDownload;
   late Uint8List apk;
 
   setUp(() {
@@ -38,6 +39,7 @@ void main() {
     platformCalls = [];
     commands = [];
     checkAnswer = {'status': 'available', 'currentBuild': 120, 'currentVersion': '1.2.0', 'latestBuild': 130, 'tag': 'b130'};
+    lastDownload = {'state': 'idle'};
     statusAnswers = [
       {'state': 'downloading', 'received': 2000, 'total': 5000},
       {'state': 'done', 'received': 5000, 'total': 5000, 'path': '/srv/agent/updates/b130-app-arm64.apk'},
@@ -58,7 +60,10 @@ void main() {
         return switch (c['type']) {
           'app_update_check' => checkAnswer,
           'app_update_download' => {'id': 'u1', 'name': 'app-arm64.apk', 'size': 5000, 'tag': 'b130'},
+          // Without an id the app asks what the host still has from before; by default nothing.
+          'app_update_status' when c['downloadId'] == null => lastDownload,
           'app_update_status' => statusAnswers.length > 1 ? statusAnswers.removeAt(0) : statusAnswers.first,
+          'app_update_cancel' => {'state': 'cancelled'},
           _ => null,
         };
       };
@@ -73,7 +78,10 @@ void main() {
       agent.fs = RemoteFs(server.call, phoneCache: Directory('${tmp.path}/cache')..createSync(), chunkSize: 1000, waitOnline: server.waitOnline);
     }
     await tester.pumpWidget(
-      MaterialApp(theme: buildTheme(Brightness.light), home: Scaffold(body: UpdateRow(agent: agent))),
+      MaterialApp(
+        theme: buildTheme(Brightness.light),
+        home: Scaffold(body: UpdateRow(agent: agent)),
+      ),
     );
     await tester.pump();
     await tester.pump();
@@ -91,7 +99,21 @@ void main() {
     fail('"$text" never appeared; the row says: ${tester.widgetList<Text>(find.byType(Text)).map((w) => w.data).join(' | ')}');
   }
 
-  Map<String, dynamic> command(String type) => commands.firstWhere((c) => c['type'] == type);
+  Map<String, dynamic> command(String type) => commands.firstWhere((c) => c['type'] == type && (type != 'app_update_status' || c['downloadId'] != null));
+  Iterable<Map<String, dynamic>> all(String type) => commands.where((c) => c['type'] == type);
+
+  /// Settings closed and opened again: a new row for the same agent.
+  Future<void> reopen(WidgetTester tester) async {
+    await tester.pumpWidget(const SizedBox());
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildTheme(Brightness.light),
+        home: Scaffold(body: UpdateRow(agent: agent)),
+      ),
+    );
+    await tester.pump();
+  }
+
   List<MethodCall> installs() => platformCalls.where((c) => c.method == 'installApk').toList();
 
   testWidgets('the check tells the host which build and CPU this app is', (tester) async {
@@ -134,6 +156,50 @@ void main() {
     await tester.tap(find.text('App updates'));
     await until(tester, 'downloaded — tap to install');
     expect(commands.where((c) => c['type'] == 'app_update_download'), hasLength(1), reason: 'the server\'s copy was reused');
+  });
+
+  testWidgets('leaving Settings neither stops nor forgets the download: it shows again and finishes, once', (tester) async {
+    statusAnswers = [
+      {'state': 'downloading', 'received': 2000, 'total': 5000},
+      {'state': 'downloading', 'received': 3000, 'total': 5000},
+      {'state': 'downloading', 'received': 4000, 'total': 5000},
+      {'state': 'done', 'received': 5000, 'total': 5000, 'path': '/srv/agent/updates/b130-app-arm64.apk'},
+    ];
+    await show(tester, onServer: true);
+    await tester.tap(find.text('App updates'));
+    await until(tester, 'The server is downloading build b130');
+    await reopen(tester);
+    expect(find.textContaining('The server is downloading build b130'), findsOneWidget, reason: 'not "tap to download" again');
+    await until(tester, 'downloaded — tap to install');
+    expect(all('app_update_download'), hasLength(1));
+  });
+
+  testWidgets('a download can be cancelled; the server is told, and the row offers it again', (tester) async {
+    statusAnswers = [
+      {'state': 'downloading', 'received': 2000, 'total': 5000},
+    ];
+    await show(tester, onServer: true);
+    await tester.tap(find.text('App updates'));
+    await until(tester, 'The server is downloading build b130');
+    await tester.tap(find.byTooltip('Cancel download'));
+    await tester.pump();
+    expect(command('app_update_cancel'), containsPair('downloadId', 'u1'));
+    expect(find.textContaining('build b130 available, tap to download'), findsOneWidget);
+    expect(find.byTooltip('Cancel download'), findsNothing);
+  });
+
+  testWidgets('after the app was closed, a download the server finished is picked up and brought to the phone', (tester) async {
+    lastDownload = {'id': 'u7', 'state': 'done', 'received': 5000, 'total': 5000, 'tag': 'b130', 'path': '/srv/agent/updates/b130-app-arm64.apk'};
+    await show(tester, onServer: true);
+    await until(tester, 'downloaded — tap to install');
+    expect(all('app_update_download'), isEmpty, reason: 'nothing was downloaded again');
+  });
+
+  testWidgets('a download for a build this app already is, is left alone', (tester) async {
+    lastDownload = {'id': 'u7', 'state': 'done', 'received': 5000, 'total': 5000, 'tag': 'b120', 'path': '/srv/agent/updates/b120-app-arm64.apk'};
+    await show(tester, onServer: true);
+    await until(tester, 'build b130 available');
+    expect(find.textContaining('tap to install'), findsNothing);
   });
 
   testWidgets('on this phone the downloaded file is installed where it is', (tester) async {

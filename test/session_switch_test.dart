@@ -14,36 +14,20 @@ void main() {
   final asked = <String>[];
 
   setUp(() {
-    final messenger =
-        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-    messenger.setMockMethodCallHandler(
-      PlatformBackend.method,
-      (_) async => null,
-    );
-    addTearDown(
-      () => messenger.setMockMethodCallHandler(PlatformBackend.method, null),
-    );
+    final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    messenger.setMockMethodCallHandler(PlatformBackend.method, (_) async => null);
+    addTearDown(() => messenger.setMockMethodCallHandler(PlatformBackend.method, null));
     backend = FakeBackend()..running = true;
-    agent = AgentController(
-      AgentClient(backend: backend)
-        ..backoff = ((_) => const Duration(milliseconds: 20)),
-    );
+    agent = AgentController(AgentClient(backend: backend)..backoff = ((_) => const Duration(milliseconds: 20)));
     asked.clear();
     // Stands in for the host: busy unless the switch is meant.
     backend.onCommand = (c) {
       switch (c['type']) {
         case 'open_session' || 'new_session' || 'fork_session':
-          if (c['force'] != true)
-            throw const FakeFailure(
-              'The agent is still working in this chat.',
-              code: 'busy',
-            );
-          return {
-            'sessionId': 'new',
-            'sessionFile': '/s/new.jsonl',
-            'cwd': '/w',
-            'isStreaming': false,
-          };
+          if (c['force'] != true) {
+            throw const FakeFailure('The agent is still working in this chat.', code: 'busy');
+          }
+          return {'sessionId': 'new', 'sessionFile': '/s/new.jsonl', 'cwd': '/w', 'isStreaming': false};
         case 'messages':
           return <Object>[];
         default:
@@ -52,24 +36,18 @@ void main() {
     };
   });
 
-  Iterable<Map<String, dynamic>> sent(String type) =>
-      backend.sent.where((c) => c['type'] == type);
+  Iterable<Map<String, dynamic>> sent(String type) => backend.sent.where((c) => c['type'] == type);
 
-  test(
-    'keeping the chat that is working sends nothing more and reports no switch',
-    () async {
-      agent.confirmStop = (message) async {
-        asked.add(message);
-        return false;
-      };
-      expect(await agent.openSession('/s/other.jsonl'), isFalse);
-      expect(asked, ['The agent is still working in this chat.']);
-      expect(sent('open_session').map((c) => c['force']), [
-        null,
-      ], reason: 'not sent again with force');
-      expect(agent.sessionId, isNot('new'));
-    },
-  );
+  test('keeping the chat that is working sends nothing more and reports no switch', () async {
+    agent.confirmStop = (message) async {
+      asked.add(message);
+      return false;
+    };
+    expect(await agent.openSession('/s/other.jsonl'), isFalse);
+    expect(asked, ['The agent is still working in this chat.']);
+    expect(sent('open_session').map((c) => c['force']), [null], reason: 'not sent again with force');
+    expect(agent.sessionId, isNot('new'));
+  });
 
   test('stopping it switches with force', () async {
     agent.confirmStop = (_) async => true;
@@ -79,9 +57,6 @@ void main() {
   });
 
   test('without anyone to ask, the refusal reaches the caller', () async {
-    await expectLater(
-      agent.openSession('/s/other.jsonl'),
-      throwsA(isA<AgentError>().having((e) => e.code, 'code', 'busy')),
-    );
+    await expectLater(agent.openSession('/s/other.jsonl'), throwsA(isA<AgentError>().having((e) => e.code, 'code', 'busy')));
   });
 }

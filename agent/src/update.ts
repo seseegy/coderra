@@ -10,7 +10,7 @@
  * repository is private, and successful lookups are cached for 6 hours in
  * <agentDir>/andropi/update-check.json so opening Settings stays cheap.
  */
-import { createWriteStream, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { createWriteStream, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -134,7 +134,8 @@ export async function checkAppUpdate(
 // filesDir and therefore servable by the app's FileProvider installer.
 
 export interface UpdateDownload {
-	state: "downloading" | "done" | "error";
+	id?: string;
+	state: "downloading" | "done" | "error" | "cancelled";
 	received: number;
 	total: number;
 	path?: string;
@@ -142,9 +143,23 @@ export interface UpdateDownload {
 	message?: string;
 }
 
-const downloads = new Map<string, UpdateDownload>();
-let downloadSeq = 0;
+interface DownloadJob extends UpdateDownload {
+	id: string;
+	file: string;
+	abort?: AbortController;
+}
 
+const downloads = new Map<string, DownloadJob>();
+let downloadSeq = 0;
+/** The download started last: what the app shows again when its screen is opened anew. */
+let latestId: string | undefined;
+
+const view = ({ file: _file, abort: _abort, ...rec }: DownloadJob): UpdateDownload => ({ ...rec });
+
+/**
+ * Starts downloading the latest release's APK, or joins what is already there: a download of the same file that is
+ * still going is not started twice, and a file that is already complete is not fetched again.
+ */
 export async function startAppUpdateDownload(
 	agentDir: string,
 	githubApi: (path: string) => Promise<any>,
@@ -159,39 +174,90 @@ export async function startAppUpdateDownload(
 	mkdirSync(dir, { recursive: true });
 	// The names come from GitHub: whatever they hold, the file stays in this folder.
 	const file = join(dir, `${tag}-${asset.name}`.replace(/[^A-Za-z0-9._-]/g, "_"));
+	const answer = (job: DownloadJob) => {
+		latestId = job.id;
+		return { id: job.id, name: asset.name, size: asset.size, tag };
+	};
+
+	const going = [...downloads.values()].find((j) => j.file === file && j.state === "downloading");
+	if (going) return answer(going);
+
 	const id = `u${++downloadSeq}`;
-	const rec: UpdateDownload = { state: "downloading", received: 0, total: asset.size, tag };
-	downloads.set(id, rec);
+	const job: DownloadJob = { id, file, state: "downloading", received: 0, total: asset.size, tag };
+	downloads.set(id, job);
+	if (asset.size > 0 && sizeOf(file) === asset.size) {
+		Object.assign(job, { state: "done", received: asset.size, path: file });
+		return answer(job);
+	}
+
+	// Written beside the final name and renamed when complete, so a half-written file is never taken for the APK.
+	const part = `${file}.part`;
+	const abort = new AbortController();
+	job.abort = abort;
 	void (async () => {
 		try {
 			const res = await githubRaw(`/repos/${REPO}/releases/assets/${asset.id}`, {
 				headers: { Accept: "application/octet-stream" },
+				signal: abort.signal,
 			});
 			if (!res.ok || !res.body) throw new Error(`GitHub download failed (${res.status})`);
 			const source = Readable.fromWeb(res.body as any);
 			source.on("data", (chunk: Buffer) => {
-				rec.received += chunk.length;
+				job.received += chunk.length;
 			});
-			await pipeline(source, createWriteStream(file));
-			const size = statSync(file).size;
+			await pipeline(source, createWriteStream(part), { signal: abort.signal });
+			const size = statSync(part).size;
 			if (asset.size && size !== asset.size) {
 				throw new Error(`Download incomplete (${size} of ${asset.size} bytes)`);
 			}
-			rec.state = "done";
-			rec.path = file;
+			renameSync(part, file);
+			job.state = "done";
+			job.path = file;
 		} catch (e: any) {
-			rec.state = "error";
-			rec.message = String(e?.message ?? e).slice(0, 200);
+			if (job.state === "downloading") {
+				job.state = "error";
+				job.message = String(e?.message ?? e).slice(0, 200);
+			}
 			try {
-				unlinkSync(file);
+				unlinkSync(part);
 			} catch {
 				// Partial file may not exist.
 			}
+		} finally {
+			job.abort = undefined;
 		}
 	})();
-	return { id, name: asset.name, size: asset.size, tag };
+	return answer(job);
 }
 
-export function appUpdateDownloadStatus(id: string): UpdateDownload {
-	return downloads.get(id) ?? { state: "error", received: 0, total: 0, message: "Unknown download" };
+function sizeOf(file: string): number {
+	try {
+		return statSync(file).size;
+	} catch {
+		return -1;
+	}
+}
+
+/** One download by its id; without an id, the one started last (or "idle" when there is none). */
+export function appUpdateDownloadStatus(id?: string): UpdateDownload | { state: "idle" } {
+	if (!id) {
+		const last = latestId ? downloads.get(latestId) : undefined;
+		return last ? view(last) : { state: "idle" };
+	}
+	const job = downloads.get(id);
+	return job ? view(job) : { state: "error", received: 0, total: 0, message: "Unknown download" };
+}
+
+/**
+ * The user stopped it. A download that is going is aborted and its partial file removed; one that is complete keeps
+ * its file (a later start finds it), but is no longer offered to a screen that opens anew.
+ */
+export function cancelAppUpdateDownload(id: string): UpdateDownload | { state: "idle" } {
+	const job = downloads.get(id);
+	if (!job) return { state: "idle" };
+	if (job.state === "downloading" || job.state === "done") {
+		job.state = "cancelled";
+		job.abort?.abort();
+	}
+	return view(job);
 }
